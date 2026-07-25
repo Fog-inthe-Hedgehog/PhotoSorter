@@ -9,10 +9,19 @@ requires-python = ">=3.13"
 dependencies = [
     "pillow (>=12.3.0,<13.0.0)",
     "pillow-heif (>=1.5.0,<2.0.0)",
-    "tkinterdnd2 (>=0.6.2,<0.7.0)"
+    "flet (>=0.86.2,<0.87.0)",
+    "flet-dropzone (>=0.3.1,<0.4.0)",
 ]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.flet]
+org = "com.photosorter"
+product = "Photo Sorter"
+company = "PhotoSorter"
+
+[tool.flet.app]
+path = "."

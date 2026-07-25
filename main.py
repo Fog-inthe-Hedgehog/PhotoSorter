@@ -1,745 +1,737 @@
-import json
+"""Photo Sorter — Flet desktop UI."""
+
+from __future__ import annotations
+
+import asyncio
 import shutil
 import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
 
-import tkinter as tk
-from PIL import Image
-from PIL.ExifTags import IFD, TAGS, Base
-from pillow_heif import register_heif_opener
-from tkinter import filedialog, messagebox, ttk
+import flet as ft
+import flet_dropzone as ftd
 
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    HAS_DND = True
-except ImportError:
-    HAS_DND = False
-
-register_heif_opener()
-
-VIDEO_EXTENSIONS = {
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".mkv",
-    ".3gp",
-    ".m4v",
-    ".wmv",
-    ".flv",
-    ".webm",
-    ".mpeg",
-    ".mpg",
-}
-
-IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".bmp",
-    ".tiff",
-    ".tif",
-    ".heic",
-    ".heif",
-    ".webp",
-    ".ico",
-}
-
-SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-
-UNSORTED_DIR_NAME = "Unknown Device"
-
-EXIF_DATE_TAGS = (
-    Base.DateTimeOriginal,
-    Base.DateTimeDigitized,
-    Base.DateTime,
+from sorter import (
+    UNSORTED_DIR_NAME,
+    PhotoSorter,
+    ffprobe_available,
+    paths_overlap,
 )
 
+# Theme — light slate + teal accent
+BG = "#F4F6F8"
+SURFACE = "#FFFFFF"
+BORDER = "#D7DEE7"
+TEXT = "#1C2430"
+MUTED = "#5B6B7C"
+ACCENT = "#0F766E"
+ACCENT_SOFT = "#CCFBF1"
+DROP_IDLE = "#EEF2F6"
+LOG_BG = "#1C2430"
+OK = "#15803D"
+WARN = "#B45309"
+PILL_OK_BG = "#DCFCE7"
+PILL_WARN_BG = "#FEF3C7"
+PILL_MUTE_BG = "#E8EEF4"
 
-def decode_meta_str(value: str | bytes | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="ignore")
-    elif not isinstance(value, str):
-        value = str(value)
-    value = value.strip().strip("\x00")
-    return value or None
+LOG_COLORS = {
+    "info": "#E8EEF4",
+    "ok": "#4ADE80",
+    "warn": "#FBBF24",
+    "error": "#F87171",
+}
 
-
-def parse_exif_datetime(value: str | bytes | None) -> datetime | None:
-    text = decode_meta_str(value)
-    if not text:
-        return None
-    try:
-        return datetime.strptime(text, "%Y:%m:%d %H:%M:%S")
-    except ValueError:
-        return None
-
-
-def parse_video_datetime(value: str | bytes | None) -> datetime | None:
-    text = decode_meta_str(value)
-    if not text:
-        return None
-    cleaned = text.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(cleaned)
-    except ValueError:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y:%m:%d %H:%M:%S"):
-            try:
-                return datetime.strptime(text, fmt)
-            except ValueError:
-                continue
-        return None
-
-    if dt.tzinfo is not None:
-        dt = dt.astimezone().replace(tzinfo=None)
-    return dt
+# Coalesce worker UI updates onto the event loop (ms).
+UI_BATCH_MS = 100
 
 
-def device_from_make_model(make: str | None, model: str | None) -> str | None:
-    make = (make or "").strip()
-    model = (model or "").strip()
-    if make and model:
-        if model.lower().startswith(make.lower()):
-            return model
-        return f"{make} {model}".strip()
-    return make or model or None
-
-
-def device_folder_name(device: str | None) -> str:
-    """Folder under year: device name, or «не отсортировано» if unknown."""
-    if not device or not str(device).strip():
-        return UNSORTED_DIR_NAME
-    return safe_name(str(device), fallback=UNSORTED_DIR_NAME)
-
-
-def safe_name(name: str, fallback: str = "Unknown") -> str:
-    invalid_chars = '<>:"/\\|?*'
-    cleaned = "".join("_" if ch in invalid_chars else ch for ch in name)
-    cleaned = cleaned.strip(" .")
-    return cleaned or fallback
-
-
-def unique_path(path: Path) -> Path:
-    if not path.exists():
+def shorten_path(path: str, max_len: int = 64) -> str:
+    if len(path) <= max_len:
         return path
-    stem, suffix = path.stem, path.suffix
-    counter = 1
-    while True:
-        candidate = path.with_name(f"{stem}_{counter}{suffix}")
-        if not candidate.exists():
-            return candidate
-        counter += 1
+    return "…" + path[-(max_len - 1) :]
 
 
-def paths_overlap(source: Path, dest: Path) -> bool:
+async def pick_directory(title: str) -> str | None:
+    """Native directory picker (FilePicker → Zenity fallback)."""
     try:
-        source_resolved = source.resolve()
-        dest_resolved = dest.resolve()
-    except OSError:
-        return False
-    return (
-        source_resolved == dest_resolved
-        or source_resolved in dest_resolved.parents
-        or dest_resolved in source_resolved.parents
-    )
+        path = await ft.FilePicker().get_directory_path(dialog_title=title)
+        if path:
+            return path
+    except Exception:
+        pass
 
-
-def ffprobe_available() -> bool:
-    return shutil.which("ffprobe") is not None
-
-
-class PhotoSorterApp:
-    def __init__(self, root, dnd_enabled: bool = False):
-        self.root = root
-        self.dnd_enabled = dnd_enabled
-        self.root.title("Photo Sorter by Metadata")
-        self.root.geometry("800x650")
-
-        self.source_folder = tk.StringVar()
-        self.destination_folder = tk.StringVar()
-        self.status_text = tk.StringVar(value="Готов к работе")
-        self.progress_var = tk.DoubleVar()
-
-        self.supported_extensions = SUPPORTED_EXTENSIONS
-        self.is_sorting = False
-        self._sort_thread: threading.Thread | None = None
-
-        self.setup_ui()
-        if self.dnd_enabled:
-            self.setup_drag_drop()
-
-        if not ffprobe_available():
-            self.log_message(
-                "Предупреждение: ffprobe не найден — метаданные видео будут "
-                "браться из времени изменения файла"
-            )
-
-    def ui_call(self, func, *args, **kwargs):
-        """Schedule a callable on the Tk main thread."""
-        self.root.after(0, lambda: func(*args, **kwargs))
-
-    def setup_ui(self):
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(
-            main_frame,
-            text="Сортировка фотографий по метаданным",
-            font=("Arial", 16, "bold"),
-        ).pack(pady=10)
-
-        # Destination
-        dest_frame = ttk.LabelFrame(main_frame, text="Папка для сохранения", padding="10")
-        dest_frame.pack(fill=tk.X, pady=5)
-
-        dest_row = ttk.Frame(dest_frame)
-        dest_row.pack(fill=tk.X)
-        ttk.Entry(dest_row, textvariable=self.destination_folder).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5)
-        )
-        ttk.Button(
-            dest_row, text="Выбрать папку", command=self.select_destination_folder
-        ).pack(side=tk.RIGHT)
-
-        # Source
-        source_frame = ttk.LabelFrame(
-            main_frame, text="Папка с фотографиями (исходная)", padding="10"
-        )
-        source_frame.pack(fill=tk.X, pady=5)
-
-        source_row = ttk.Frame(source_frame)
-        source_row.pack(fill=tk.X)
-        ttk.Entry(source_row, textvariable=self.source_folder).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5)
-        )
-        ttk.Button(
-            source_row, text="Выбрать папку", command=self.select_source_folder
-        ).pack(side=tk.RIGHT)
-
-        # Drop / hint area
-        drop_title = (
-            "Перетащите папку с фотографиями сюда"
-            if self.dnd_enabled
-            else "Исходная папка"
-        )
-        drop_frame = ttk.LabelFrame(main_frame, text=drop_title, padding="10")
-        drop_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        self.drop_area = tk.Text(
-            drop_frame, height=8, bg="lightgray", font=("Arial", 12), wrap=tk.WORD
-        )
-        self.drop_area.pack(fill=tk.BOTH, expand=True)
-        self._reset_drop_area_text()
-        self.drop_area.config(state="disabled")
-
-        # Progress
-        progress_frame = ttk.Frame(main_frame)
-        progress_frame.pack(fill=tk.X, pady=10)
-
-        self.progress_bar = ttk.Progressbar(
-            progress_frame, variable=self.progress_var, maximum=100
-        )
-        self.progress_bar.pack(fill=tk.X, pady=5)
-        ttk.Label(progress_frame, textvariable=self.status_text).pack()
-
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(pady=10)
-
-        self.start_button = ttk.Button(
-            button_frame, text="Начать сортировку", command=self.start_sorting
-        )
-        self.start_button.pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Очистить лог", command=self.clear_log).pack(
-            side=tk.LEFT, padx=5
-        )
-
-        # Log with scrollbar in a frame
-        log_frame = ttk.LabelFrame(main_frame, text="Лог операций", padding="5")
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        log_container = ttk.Frame(log_frame)
-        log_container.pack(fill=tk.BOTH, expand=True)
-
-        self.log_text = tk.Text(
-            log_container, height=8, bg="white", font=("Consolas", 9), wrap=tk.WORD
-        )
-        scrollbar = ttk.Scrollbar(log_container, command=self.log_text.yview)
-        self.log_text.config(yscrollcommand=scrollbar.set)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-    def _reset_drop_area_text(self):
-        self.drop_area.config(state="normal")
-        self.drop_area.delete("1.0", tk.END)
-        if self.dnd_enabled:
-            self.drop_area.insert(tk.END, "Перетащите папку с фотографиями сюда\n\n")
-        else:
-            self.drop_area.insert(
-                tk.END,
-                "Drag-and-drop недоступен. Выберите исходную папку кнопкой выше.\n\n",
-            )
-        self.drop_area.insert(tk.END, "Поддерживаемые форматы:\n")
-        self.drop_area.insert(
-            tk.END, "Фото: JPG, PNG, HEIC, WebP, GIF, BMP, TIFF\n"
-        )
-        self.drop_area.insert(
-            tk.END, "Видео: MP4, MOV, AVI, 3GP, MKV, M4V, WMV, FLV, WEBM\n\n"
-        )
-        self.drop_area.insert(
-            tk.END,
-            "Структура: год съёмки / устройство / имя по дате изменения файла\n"
-            f"Без устройства или при сбое: год / {UNSORTED_DIR_NAME}",
-        )
-        self.drop_area.config(state="disabled")
-
-    def setup_drag_drop(self):
-        self.drop_area.drop_target_register(DND_FILES)
-        self.drop_area.dnd_bind("<<Drop>>", self.on_drop)
-        self.drop_area.dnd_bind("<<DragEnter>>", self.on_drag_enter)
-        self.drop_area.dnd_bind("<<DragLeave>>", self.on_drag_leave)
-
-    def on_drag_enter(self, event):
-        self.drop_area.config(bg="lightgreen")
-
-    def on_drag_leave(self, event):
-        self.drop_area.config(bg="lightgray")
-
-    def on_drop(self, event):
-        self.drop_area.config(bg="lightgray")
-        files = self.root.tk.splitlist(event.data)
-        if not files:
-            return
-        path = Path(files[0])
-        if path.is_dir():
-            self.set_source_folder(path)
-        else:
-            self.log_message("Перетащите папку, а не отдельные файлы")
-            messagebox.showwarning("Предупреждение", "Перетащите папку с фотографиями")
-
-    def set_source_folder(self, path: Path):
-        self.source_folder.set(str(path))
-        self.log_message(f"Выбрана исходная папка: {path}")
-        self.drop_area.config(state="normal")
-        self.drop_area.delete("1.0", tk.END)
-        self.drop_area.insert(tk.END, f"Выбрана папка:\n{path}\n\n")
-        self.drop_area.insert(tk.END, "Нажмите «Начать сортировку» для обработки")
-        self.drop_area.config(state="disabled")
-
-    def select_source_folder(self):
-        folder = filedialog.askdirectory(title="Выберите папку с фотографиями")
-        if folder:
-            self.set_source_folder(Path(folder))
-
-    def select_destination_folder(self):
-        folder = filedialog.askdirectory(title="Выберите папку для сохранения")
-        if folder:
-            self.destination_folder.set(folder)
-            self.log_message(f"Папка сохранения: {folder}")
-
-    def log_message(self, message: str):
-        def _log():
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-            self.log_text.see(tk.END)
-
-        if threading.current_thread() is threading.main_thread():
-            _log()
-        else:
-            self.ui_call(_log)
-
-    def set_progress(self, processed: int, total: int):
-        def _update():
-            self.progress_var.set((processed / total) * 100 if total else 0)
-            self.status_text.set(f"Обработано: {processed}/{total}")
-
-        if threading.current_thread() is threading.main_thread():
-            _update()
-        else:
-            self.ui_call(_update)
-
-    def clear_log(self):
-        self.log_text.delete("1.0", tk.END)
-
-    def get_modification_datetime(self, file_path: Path) -> datetime:
-        try:
-            return datetime.fromtimestamp(file_path.stat().st_mtime)
-        except OSError:
-            return datetime.now()
-
-    def build_result(
-        self,
-        file_path: Path,
-        capture_dt: datetime | None,
-        device: str | None,
-    ) -> dict:
-        """Year from capture (fallback mtime); device may be None → unsorted; name from mtime."""
-        mod_dt = self.get_modification_datetime(file_path)
-        year_dt = capture_dt or mod_dt
-        ext = file_path.suffix.lower()
-        return {
-            "datetime": capture_dt or mod_dt,
-            "device": device,
-            "year": year_dt.strftime("%Y"),
-            "filename": f"{mod_dt.strftime('%Y-%m-%d_%H-%M-%S')}{ext}",
-        }
-
-    def extract_image_capture_info(
-        self, file_path: Path
-    ) -> tuple[datetime | None, str | None]:
-        try:
-            with Image.open(file_path) as img:
-                exif = img.getexif()
-                if not exif:
-                    return None, None
-
-                make = exif.get(Base.Make)
-                model = exif.get(Base.Model)
-                device = device_from_make_model(
-                    decode_meta_str(make),
-                    decode_meta_str(model),
-                )
-
-                capture_dt = None
-                # Prefer DateTimeOriginal / Digitized from Exif IFD
-                try:
-                    exif_ifd = exif.get_ifd(IFD.Exif)
-                except Exception:
-                    exif_ifd = {}
-
-                for tag in (Base.DateTimeOriginal, Base.DateTimeDigitized):
-                    if exif_ifd and tag in exif_ifd:
-                        capture_dt = parse_exif_datetime(exif_ifd.get(tag))
-                        if capture_dt:
-                            break
-
-                if capture_dt is None:
-                    for tag in EXIF_DATE_TAGS:
-                        value = exif.get(tag)
-                        if value:
-                            capture_dt = parse_exif_datetime(value)
-                            if capture_dt:
-                                break
-
-                # Fallback: scan by tag name (some HEIC paths)
-                if capture_dt is None:
-                    for tag_id, value in exif.items():
-                        tag_name = TAGS.get(tag_id, "")
-                        if tag_name in (
-                            "DateTimeOriginal",
-                            "DateTimeDigitized",
-                            "DateTime",
-                        ):
-                            capture_dt = parse_exif_datetime(value)
-                            if capture_dt:
-                                break
-
-                return capture_dt, device
-        except Exception as exc:
-            self.log_message(f"Ошибка чтения EXIF {file_path.name}: {exc}")
-            return None, None
-
-    def extract_video_capture_info(
-        self, file_path: Path
-    ) -> tuple[datetime | None, str | None]:
-        if not ffprobe_available():
-            return None, None
-
-        cmd = [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(file_path),
-        ]
+    zenity = shutil.which("zenity")
+    if zenity:
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, check=False, timeout=60
+                [zenity, "--file-selection", "--directory", f"--title={title}"],
+                capture_output=True,
+                text=True,
+                check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            self.log_message(f"Ошибка ffprobe {file_path.name}: {exc}")
-            return None, None
+            if result.returncode == 0:
+                chosen = (result.stdout or "").strip()
+                return chosen or None
+        except OSError:
+            pass
+    return None
 
-        if result.returncode != 0:
-            return None, None
 
-        try:
-            data = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            return None, None
+def main(page: ft.Page) -> None:
+    page.title = "Photo Sorter"
+    page.window.width = 920
+    page.window.height = 740
+    page.window.min_width = 780
+    page.window.min_height = 640
+    page.bgcolor = BG
+    page.padding = 20
+    page.theme_mode = ft.ThemeMode.LIGHT
+    page.theme = ft.Theme(
+        color_scheme_seed=ACCENT,
+        font_family="Roboto",
+    )
 
-        tags: dict = {}
-        if isinstance(data.get("format"), dict):
-            tags.update(data["format"].get("tags") or {})
-        for stream in data.get("streams") or []:
-            if isinstance(stream, dict):
-                tags.update(stream.get("tags") or {})
+    loop = asyncio.get_running_loop()
+    cancel_event = threading.Event()
 
-        # Normalize keys to lower for lookup
-        lower_tags = {str(k).lower(): v for k, v in tags.items()}
+    source_path = ""
+    dest_path = ""
+    is_sorting = False
+    has_ffprobe = ffprobe_available()
 
-        make = lower_tags.get("make") or lower_tags.get("com.apple.quicktime.make")
-        model = lower_tags.get("model") or lower_tags.get("com.apple.quicktime.model")
-        device = device_from_make_model(
-            decode_meta_str(make if make is not None else None),
-            decode_meta_str(model if model is not None else None),
-        )
+    # Batched UI state (mutated only on the asyncio loop)
+    pending_logs: list[tuple[str, str]] = []
+    pending_progress: tuple[int, int, int] | None = None
+    flush_task: asyncio.Task | None = None
 
-        capture_dt = None
-        date_keys = (
-            "creation_time",
-            "com.apple.quicktime.creationdate",
-            "date",
-            "date_time_original",
-        )
-        for key in date_keys:
-            if key in lower_tags:
-                capture_dt = parse_video_datetime(lower_tags[key])
-                if capture_dt:
-                    break
+    dest_field = ft.TextField(
+        label="Папка сохранения",
+        hint_text="Укажите путь или нажмите «Обзор…»",
+        expand=True,
+        border_color=BORDER,
+        focused_border_color=ACCENT,
+        bgcolor=SURFACE,
+    )
+    source_field = ft.TextField(
+        label="Исходная папка",
+        hint_text="Укажите путь или нажмите «Обзор…»",
+        expand=True,
+        border_color=BORDER,
+        focused_border_color=ACCENT,
+        bgcolor=SURFACE,
+    )
 
-        if capture_dt is None:
-            for key, value in lower_tags.items():
-                if "creation_time" in key or key.endswith("date"):
-                    capture_dt = parse_video_datetime(value)
-                    if capture_dt:
-                        break
+    drop_title = ft.Text(
+        "Перетащите папку сюда",
+        size=16,
+        weight=ft.FontWeight.BOLD,
+        color=TEXT,
+        text_align=ft.TextAlign.CENTER,
+    )
+    drop_detail = ft.Text(
+        "JPG, PNG, HEIC, WebP · MP4, MOV, 3GP и др.\n"
+        "Или нажмите, чтобы выбрать папку",
+        size=12,
+        color=MUTED,
+        text_align=ft.TextAlign.CENTER,
+    )
+    drop_zone = ft.Container(
+        content=ft.Column(
+            [drop_title, drop_detail],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=8,
+            tight=True,
+        ),
+        bgcolor=DROP_IDLE,
+        border=ft.Border.all(1, BORDER),
+        border_radius=12,
+        padding=28,
+        alignment=ft.Alignment.CENTER,
+        ink=True,
+        height=120,
+    )
 
-        return capture_dt, device
+    def on_drop_entered(_e=None) -> None:
+        if is_sorting:
+            return
+        drop_zone.bgcolor = ACCENT_SOFT
+        drop_zone.border = ft.Border.all(2, ACCENT)
+        drop_title.value = "Отпустите, чтобы выбрать"
+        page.update()
 
-    def get_metadata(self, file_path: Path) -> dict:
-        file_path = Path(file_path)
-        ext = file_path.suffix.lower()
-
-        if ext in VIDEO_EXTENSIONS:
-            capture_dt, device = self.extract_video_capture_info(file_path)
+    def on_drop_exited(_e=None) -> None:
+        if is_sorting:
+            return
+        if source_path:
+            p = Path(source_path)
+            drop_title.value = p.name or source_path
+            drop_detail.value = shorten_path(source_path, 72)
+            drop_zone.bgcolor = ACCENT_SOFT
+            drop_zone.border = ft.Border.all(2, ACCENT)
         else:
-            capture_dt, device = self.extract_image_capture_info(file_path)
+            drop_title.value = "Перетащите папку сюда"
+            drop_detail.value = (
+                "JPG, PNG, HEIC, WebP · MP4, MOV, 3GP и др.\n"
+                "Или нажмите, чтобы выбрать папку"
+            )
+            drop_zone.bgcolor = DROP_IDLE
+            drop_zone.border = ft.Border.all(1, BORDER)
+        page.update()
 
-        return self.build_result(file_path, capture_dt, device)
+    def on_files_dropped(e: ftd.DropzoneEvent) -> None:
+        if is_sorting:
+            return
+        files = list(e.files or [])
+        if not files:
+            on_drop_exited()
+            return
 
-    def copy_to_unsorted(
-        self,
-        file_path: Path,
-        dest_path: Path,
-        year: str | None = None,
-    ) -> Path | None:
-        """Copy file into {year}/Unknown Devices/. Returns destination path or None."""
+        path = Path(files[0])
+        if path.is_dir():
+            set_source(str(path))
+            return
+        if path.is_file():
+            show_dialog(
+                "Предупреждение",
+                "Перетащите папку с фотографиями, а не отдельный файл.",
+            )
+            on_drop_exited()
+            return
+
+        # Some desktops report a path that exists only after resolve
+        resolved = path.resolve() if path.exists() else path
+        if resolved.is_dir():
+            set_source(str(resolved))
+        else:
+            show_dialog(
+                "Предупреждение",
+                "Перетащите папку с фотографиями, а не отдельный файл.",
+            )
+            on_drop_exited()
+
+    drop_target = ftd.Dropzone(
+        content=drop_zone,
+        on_dropped=on_files_dropped,
+        on_entered=on_drop_entered,
+        on_exited=on_drop_exited,
+        expand=False,
+        height=120,
+    )
+
+    pill_source = ft.Container(
+        content=ft.Text("Source · не выбран", size=12, color=MUTED),
+        bgcolor=PILL_MUTE_BG,
+        padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+        border_radius=20,
+    )
+    pill_dest = ft.Container(
+        content=ft.Text("Dest · не выбран", size=12, color=MUTED),
+        bgcolor=PILL_MUTE_BG,
+        padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+        border_radius=20,
+    )
+    pill_video = ft.Container(
+        content=ft.Text(
+            "Video meta · ffprobe OK" if has_ffprobe else "Video meta · без ffprobe",
+            size=12,
+            color=OK if has_ffprobe else WARN,
+        ),
+        bgcolor=PILL_OK_BG if has_ffprobe else PILL_WARN_BG,
+        padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+        border_radius=20,
+    )
+
+    progress_bar = ft.ProgressBar(
+        value=0,
+        color=ACCENT,
+        bgcolor=DROP_IDLE,
+        bar_height=10,
+        border_radius=6,
+    )
+    status_text = ft.Text("Готов к работе", size=12, color=MUTED)
+
+    start_btn = ft.Button(
+        "Начать сортировку",
+        icon=ft.Icons.PLAY_ARROW_ROUNDED,
+        bgcolor=ACCENT,
+        color=ft.Colors.WHITE,
+        disabled=True,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10),
+            padding=ft.Padding.symmetric(horizontal=20, vertical=14),
+        ),
+    )
+    cancel_btn = ft.OutlinedButton(
+        "Отмена",
+        icon=ft.Icons.STOP_ROUNDED,
+        disabled=True,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10),
+            padding=ft.Padding.symmetric(horizontal=16, vertical=14),
+        ),
+    )
+    clear_btn = ft.OutlinedButton(
+        "Очистить лог",
+        icon=ft.Icons.DELETE_OUTLINE,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10),
+            padding=ft.Padding.symmetric(horizontal=16, vertical=14),
+        ),
+    )
+    save_log_btn = ft.OutlinedButton(
+        "Сохранить лог",
+        icon=ft.Icons.SAVE_OUTLINED,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10),
+            padding=ft.Padding.symmetric(horizontal=16, vertical=14),
+        ),
+    )
+    browse_dest_btn = ft.OutlinedButton("Обзор…", icon=ft.Icons.FOLDER_OPEN)
+    browse_source_btn = ft.OutlinedButton("Обзор…", icon=ft.Icons.FOLDER_OPEN)
+
+    log_list = ft.ListView(expand=True, spacing=2, auto_scroll=True, padding=12)
+    log_panel = ft.Container(
+        content=log_list,
+        bgcolor=LOG_BG,
+        border_radius=10,
+        expand=True,
+        padding=0,
+    )
+
+    def show_dialog(title: str, message: str) -> None:
+        def close(_e=None):
+            page.pop_dialog()
+
+        page.show_dialog(
+            ft.AlertDialog(
+                title=ft.Text(title),
+                content=ft.Text(message),
+                actions=[ft.TextButton("OK", on_click=close)],
+                modal=True,
+            )
+        )
+
+    def _append_log_control(message: str, level: str = "info") -> None:
+        tag = level if level in LOG_COLORS else "info"
+        stamp = datetime.now().strftime("%H:%M:%S")
+        log_list.controls.append(
+            ft.Text(
+                f"[{stamp}] {message}",
+                size=12,
+                color=LOG_COLORS[tag],
+                font_family="monospace",
+                selectable=True,
+            )
+        )
+
+    def _apply_progress(processed: int, total: int, errors: int) -> None:
+        progress_bar.value = (processed / total) if total else 0
+        status_text.value = f"Обработано {processed} / {total} · ошибок: {errors}"
+
+    async def flush_ui(*, force: bool = False) -> None:
+        """Apply buffered log/progress and call page.update once (event loop only)."""
+        nonlocal pending_logs, pending_progress, flush_task
+        flush_task = None
+        if not force and not pending_logs and pending_progress is None:
+            return
+
+        if pending_logs:
+            for msg, level in pending_logs:
+                _append_log_control(msg, level)
+            pending_logs = []
+
+        if pending_progress is not None:
+            _apply_progress(*pending_progress)
+            pending_progress = None
+
+        page.update()
+
+    def schedule_flush() -> None:
+        nonlocal flush_task
+        if flush_task is None or flush_task.done():
+            flush_task = loop.create_task(_delayed_flush())
+
+    async def _delayed_flush() -> None:
+        await asyncio.sleep(UI_BATCH_MS / 1000)
+        await flush_ui()
+
+    def enqueue_log(message: str, level: str = "info") -> None:
+        """Thread-safe: hop log onto the asyncio loop (batched)."""
+
+        def _enqueue() -> None:
+            pending_logs.append((message, level))
+            schedule_flush()
+
+        loop.call_soon_threadsafe(_enqueue)
+
+    def enqueue_progress(processed: int, total: int, errors: int) -> None:
+        """Thread-safe: hop progress onto the asyncio loop (coalesced)."""
+
+        def _enqueue() -> None:
+            nonlocal pending_progress
+            pending_progress = (processed, total, errors)
+            schedule_flush()
+
+        loop.call_soon_threadsafe(_enqueue)
+
+    def append_log(message: str, level: str = "info") -> None:
+        """Immediate log from the UI/event-loop thread."""
+        _append_log_control(message, level)
+        page.update()
+
+    def refresh_pills() -> None:
+        if source_path:
+            pill_source.content = ft.Text(
+                f"Source · {Path(source_path).name}", size=12, color=OK
+            )
+            pill_source.bgcolor = PILL_OK_BG
+        else:
+            pill_source.content = ft.Text("Source · не выбран", size=12, color=MUTED)
+            pill_source.bgcolor = PILL_MUTE_BG
+
+        if dest_path:
+            pill_dest.content = ft.Text(
+                f"Dest · {Path(dest_path).name}", size=12, color=OK
+            )
+            pill_dest.bgcolor = PILL_OK_BG
+        else:
+            pill_dest.content = ft.Text("Dest · не выбран", size=12, color=MUTED)
+            pill_dest.bgcolor = PILL_MUTE_BG
+
+    def update_start_enabled() -> None:
+        start_btn.disabled = not (source_path and dest_path and not is_sorting)
+        page.update()
+
+    def set_controls_busy(busy: bool) -> None:
+        browse_dest_btn.disabled = busy
+        browse_source_btn.disabled = busy
+        clear_btn.disabled = busy
+        save_log_btn.disabled = busy
+        drop_zone.disabled = busy
+        drop_target.disabled = busy
+        dest_field.disabled = busy
+        source_field.disabled = busy
+        cancel_btn.disabled = not busy
+        if busy:
+            start_btn.disabled = True
+        else:
+            start_btn.disabled = not (source_path and dest_path)
+        page.update()
+
+    def set_source(path: str, *, log: bool = True) -> None:
+        nonlocal source_path
+        source_path = path.strip()
+        p = Path(source_path)
+        source_field.value = source_path
+        drop_title.value = p.name or source_path
+        drop_detail.value = shorten_path(source_path, 72)
+        drop_zone.bgcolor = ACCENT_SOFT
+        drop_zone.border = ft.Border.all(2, ACCENT)
+        if log:
+            append_log(f"Выбрана исходная папка: {source_path}", "info")
+        refresh_pills()
+        update_start_enabled()
+
+    def set_dest(path: str, *, log: bool = True) -> None:
+        nonlocal dest_path
+        dest_path = path.strip()
+        dest_field.value = dest_path
+        if log:
+            append_log(f"Папка сохранения: {dest_path}", "info")
+        refresh_pills()
+        update_start_enabled()
+
+    def apply_source_field(_e=None) -> None:
+        value = (source_field.value or "").strip()
+        if not value:
+            return
+        if Path(value).is_dir():
+            set_source(value)
+        else:
+            show_dialog("Предупреждение", "Указанный путь исходной папки не существует")
+
+    def apply_dest_field(_e=None) -> None:
+        value = (dest_field.value or "").strip()
+        if not value:
+            return
+        parent = Path(value)
+        if parent.exists() and not parent.is_dir():
+            show_dialog(
+                "Предупреждение",
+                "Путь сохранения указывает на файл, а не папку",
+            )
+            return
+        set_dest(value)
+
+    async def pick_source(_e=None) -> None:
+        if is_sorting:
+            return
+        path = await pick_directory("Выберите папку с фотографиями")
+        if path:
+            set_source(path)
+        elif not shutil.which("zenity"):
+            show_dialog(
+                "Выбор папки",
+                "Системный диалог недоступен (нужен zenity).\n"
+                "Вставьте путь к папке в поле «Исходная папка» вручную.",
+            )
+
+    async def pick_dest(_e=None) -> None:
+        if is_sorting:
+            return
+        path = await pick_directory("Выберите папку для сохранения")
+        if path:
+            set_dest(path)
+        elif not shutil.which("zenity"):
+            show_dialog(
+                "Выбор папки",
+                "Системный диалог недоступен (нужен zenity).\n"
+                "Вставьте путь в поле «Папка сохранения» вручную.",
+            )
+
+    def clear_log(_e=None) -> None:
+        log_list.controls.clear()
+        page.update()
+
+    def save_log(_e=None) -> None:
+        nonlocal pending_logs
+        dest = (dest_field.value or dest_path or "").strip()
+        if not dest:
+            show_dialog(
+                "Предупреждение",
+                "Сначала укажите папку сохранения для фотографий",
+            )
+            return
+
+        dest_dir = Path(dest)
+        if pending_logs:
+            for msg, level in pending_logs:
+                _append_log_control(msg, level)
+            pending_logs = []
+
+        lines = [
+            ctrl.value
+            for ctrl in log_list.controls
+            if isinstance(ctrl, ft.Text) and ctrl.value
+        ]
+        if not lines:
+            show_dialog("Предупреждение", "Лог пуст — нечего сохранять")
+            return
+
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out_path = dest_dir / f"photosorter_{stamp}.log"
         try:
-            if not year:
-                year = self.get_modification_datetime(file_path).strftime("%Y")
-            folder = dest_path / year / UNSORTED_DIR_NAME
-            folder.mkdir(parents=True, exist_ok=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            show_dialog("Ошибка", f"Не удалось сохранить лог:\n{exc}")
+            return
 
-            mod_dt = self.get_modification_datetime(file_path)
-            filename = safe_name(
-                f"{mod_dt.strftime('%Y-%m-%d_%H-%M-%S')}{file_path.suffix.lower()}",
-                fallback="file",
+        append_log(f"Лог сохранён: {out_path}", "ok")
+        show_dialog(
+            "Лог сохранён",
+            f"Лог сохранён в выбранную директорию:\n{dest_dir}",
+        )
+
+    def request_cancel(_e=None) -> None:
+        if not is_sorting:
+            return
+        cancel_event.set()
+        append_log("Отмена запрошена…", "warn")
+        status_text.value = "Отмена…"
+        cancel_btn.disabled = True
+        page.update()
+
+    def on_sorting_finished(
+        success: bool, processed: int, total: int, error_count: int
+    ) -> None:
+        nonlocal is_sorting
+        was_cancelled = cancel_event.is_set()
+        is_sorting = False
+        set_controls_busy(False)
+
+        if was_cancelled:
+            status_text.value = (
+                f"Отменено · обработано {processed} / {total} · ошибок: {error_count}"
             )
-            new_file_path = unique_path(folder / filename)
-            shutil.copy2(file_path, new_file_path)
-            return new_file_path
-        except Exception as exc:
-            self.log_message(
-                f"Не удалось поместить в «{UNSORTED_DIR_NAME}» {file_path.name}: {exc}"
+            page.update()
+            show_dialog(
+                "Отменено",
+                f"Сортировка прервана.\nОбработано файлов: {processed} из {total}",
             )
-            return None
-
-    def collect_files(self, source_path: Path) -> list[Path]:
-        found: list[Path] = []
-        seen: set[Path] = set()
-        for path in source_path.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() not in self.supported_extensions:
-                continue
-            resolved = path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            found.append(path)
-        return found
-
-    def sort_files(self, source_dir: str, dest_dir: str) -> tuple[bool, int, int, int]:
-        """Returns (success, processed, total, error_count). success iff error_count == 0."""
-        source_path = Path(source_dir)
-        dest_path = Path(dest_dir)
-        processed = 0
-        error_count = 0
-        total = 0
-
-        try:
-            if not source_path.exists():
-                self.log_message(f"Ошибка: папка {source_dir} не существует")
-                return False, 0, 0, 1
-
-            dest_path.mkdir(parents=True, exist_ok=True)
-            dest_resolved = dest_path.resolve()
-
-            files_to_process = self.collect_files(source_path)
-            total = len(files_to_process)
-
-            if total == 0:
-                self.log_message("Не найдено поддерживаемых файлов в указанной папке")
-                return False, 0, 0, 0
-
-            self.log_message(f"Найдено {total} файлов для обработки")
-
-            for file_path in files_to_process:
-                year_hint: str | None = None
-                try:
-                    # Skip files already under destination to avoid re-copy loops
-                    try:
-                        file_path.resolve().relative_to(dest_resolved)
-                        continue
-                    except ValueError:
-                        pass
-
-                    metadata = self.get_metadata(file_path)
-                    year_hint = metadata["year"]
-                    folder_name = device_folder_name(metadata["device"])
-                    device_folder = dest_path / metadata["year"] / folder_name
-                    device_folder.mkdir(parents=True, exist_ok=True)
-
-                    new_filename = safe_name(metadata["filename"], fallback="file")
-                    new_file_path = unique_path(device_folder / new_filename)
-
-                    shutil.copy2(file_path, new_file_path)
-                    processed += 1
-                    self.set_progress(processed, total)
-                    if folder_name == UNSORTED_DIR_NAME:
-                        self.log_message(
-                            f"Без устройства → {new_file_path}"
-                        )
-                    else:
-                        self.log_message(f"OK {file_path.name} -> {new_file_path}")
-                except Exception as exc:
-                    self.log_message(f"Ошибка сортировки {file_path}: {exc}")
-                    fallback = self.copy_to_unsorted(
-                        file_path, dest_path, year=year_hint
-                    )
-                    if fallback is not None:
-                        processed += 1
-                        self.set_progress(processed, total)
-                        self.log_message(
-                            f"Восстановлено → {fallback}"
-                        )
-                    else:
-                        error_count += 1
-
-            success = error_count == 0
-            self.log_message(
-                f"Сортировка завершена! Обработано {processed} из {total} файлов"
-                + (f", ошибок: {error_count}" if error_count else "")
-            )
-            return success, processed, total, error_count
-        except Exception as exc:
-            error_count += 1
-            self.log_message(f"Критическая ошибка сортировки: {exc}")
-            return False, processed, total, error_count
-
-    def _sorting_finished(
-        self, success: bool, processed: int, total: int, error_count: int
-    ):
-        self.is_sorting = False
-        self.start_button.config(state="normal")
-        if total == 0 and error_count == 0:
-            self.status_text.set("Файлы не найдены")
-            messagebox.showwarning("Предупреждение", "Не найдено поддерживаемых файлов")
+        elif total == 0 and error_count == 0:
+            status_text.value = "Файлы не найдены · ошибок: 0"
+            page.update()
+            show_dialog("Предупреждение", "Не найдено поддерживаемых файлов")
         elif success:
-            self.progress_var.set(100)
-            self.status_text.set(f"Готово: {processed}/{total}")
-            messagebox.showinfo(
+            progress_bar.value = 1
+            status_text.value = (
+                f"Готово · обработано {processed} / {total} · ошибок: 0"
+            )
+            page.update()
+            show_dialog(
                 "Готово",
                 f"Сортировка завершена.\nОбработано файлов: {processed} из {total}",
             )
         else:
-            self.status_text.set(
-                f"Ошибки: {error_count}; обработано {processed}/{total}"
+            status_text.value = (
+                f"Завершено · обработано {processed} / {total} · ошибок: {error_count}"
             )
-            messagebox.showwarning(
+            page.update()
+            show_dialog(
                 "Внимание",
                 f"Сортировка завершена с ошибками.\n"
                 f"Обработано: {processed} из {total}\n"
                 f"Ошибок: {error_count}",
             )
 
-    def start_sorting(self):
-        if self.is_sorting:
-            messagebox.showinfo("Информация", "Сортировка уже выполняется")
+    async def start_sorting(_e=None) -> None:
+        nonlocal is_sorting, source_path, dest_path
+        if is_sorting:
+            show_dialog("Информация", "Сортировка уже выполняется")
             return
 
-        source = self.source_folder.get().strip()
-        destination = self.destination_folder.get().strip()
+        source_path = (source_field.value or "").strip()
+        dest_path = (dest_field.value or "").strip()
 
-        if not source:
-            messagebox.showwarning("Предупреждение", "Выберите папку с фотографиями")
+        if not source_path:
+            show_dialog("Предупреждение", "Выберите папку с фотографиями")
             return
-        if not destination:
-            messagebox.showwarning("Предупреждение", "Выберите папку для сохранения")
-            return
-
-        source_path = Path(source)
-        dest_path = Path(destination)
-
-        if not source_path.is_dir():
-            messagebox.showwarning("Предупреждение", "Исходная папка не существует")
+        if not dest_path:
+            show_dialog("Предупреждение", "Выберите папку для сохранения")
             return
 
-        if paths_overlap(source_path, dest_path):
-            messagebox.showerror(
+        src = Path(source_path)
+        dst = Path(dest_path)
+        if not src.is_dir():
+            show_dialog("Предупреждение", "Исходная папка не существует")
+            return
+        if paths_overlap(src, dst):
+            show_dialog(
                 "Ошибка",
                 "Папка сохранения не должна совпадать с исходной "
                 "и не должна быть внутри неё (и наоборот).",
             )
             return
 
-        self.is_sorting = True
-        self.start_button.config(state="disabled")
-        self.status_text.set("Сортировка начата...")
-        self.progress_var.set(0)
+        cancel_event.clear()
+        is_sorting = True
+        set_controls_busy(True)
+        progress_bar.value = 0
+        status_text.value = "Сортировка начата… · ошибок: 0"
+        append_log("Сортировка запущена", "info")
 
-        def worker():
-            success, processed, total, error_count = self.sort_files(
-                source, destination
+        def run_sort() -> tuple[bool, int, int, int]:
+            sorter = PhotoSorter(
+                on_log=enqueue_log,
+                on_progress=enqueue_progress,
+                cancel_check=cancel_event.is_set,
             )
-            self.ui_call(
-                self._sorting_finished, success, processed, total, error_count
-            )
+            return sorter.sort_files(source_path, dest_path)
 
-        self._sort_thread = threading.Thread(target=worker, daemon=True)
-        self._sort_thread.start()
-
-
-def main():
-    dnd_enabled = False
-    if HAS_DND:
         try:
-            root = TkinterDnD.Tk()
-            dnd_enabled = True
-        except Exception:
-            root = tk.Tk()
-    else:
-        root = tk.Tk()
+            result = await asyncio.to_thread(run_sort)
+        except Exception as exc:
+            await flush_ui(force=True)
+            is_sorting = False
+            set_controls_busy(False)
+            append_log(f"Критическая ошибка: {exc}", "error")
+            show_dialog("Ошибка", f"Сортировка прервалась:\n{exc}")
+            return
 
-    if not dnd_enabled:
-        messagebox.showinfo(
-            "Информация",
-            "Drag-and-drop недоступен (нужен пакет tkinterdnd2).\n"
-            "Используйте кнопку «Выбрать папку» для исходной директории.",
+        await flush_ui(force=True)
+        on_sorting_finished(*result)
+
+    browse_source_btn.on_click = pick_source
+    browse_dest_btn.on_click = pick_dest
+    drop_zone.on_click = pick_source
+    start_btn.on_click = start_sorting
+    cancel_btn.on_click = request_cancel
+    clear_btn.on_click = clear_log
+    save_log_btn.on_click = save_log
+    source_field.on_submit = apply_source_field
+    dest_field.on_submit = apply_dest_field
+    source_field.on_blur = apply_source_field
+    dest_field.on_blur = apply_dest_field
+
+    def path_card(title: str, field: ft.TextField, button: ft.OutlinedButton):
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(title, size=13, weight=ft.FontWeight.BOLD, color=TEXT),
+                    ft.Row(
+                        [field, button],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=8,
+                tight=True,
+            ),
+            bgcolor=SURFACE,
+            border=ft.Border.all(1, BORDER),
+            border_radius=12,
+            padding=16,
+            expand=True,
         )
 
-    PhotoSorterApp(root, dnd_enabled=dnd_enabled)
-    root.mainloop()
+    page.add(
+        ft.Column(
+            [
+                ft.Text("Photo Sorter", size=28, weight=ft.FontWeight.BOLD, color=TEXT),
+                ft.Text(
+                    "Год съёмки → устройство → имя по дате изменения файла",
+                    size=13,
+                    color=MUTED,
+                ),
+                ft.Container(height=8),
+                ft.Row(
+                    [
+                        path_card("Папка сохранения", dest_field, browse_dest_btn),
+                        path_card("Исходная папка", source_field, browse_source_btn),
+                    ],
+                    spacing=12,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                ),
+                ft.Container(height=4),
+                drop_target,
+                ft.Text(
+                    f"Без устройства или при сбое файлы попадут в "
+                    f"год / {UNSORTED_DIR_NAME}",
+                    size=12,
+                    color=MUTED,
+                ),
+                ft.Row([pill_source, pill_dest, pill_video], spacing=8, wrap=True),
+                ft.Container(height=4),
+                progress_bar,
+                status_text,
+                ft.Row(
+                    [start_btn, cancel_btn, save_log_btn, clear_btn],
+                    spacing=10,
+                    wrap=True,
+                ),
+                ft.Text(
+                    "Лог операций",
+                    size=13,
+                    weight=ft.FontWeight.BOLD,
+                    color=TEXT,
+                ),
+                log_panel,
+            ],
+            expand=True,
+            spacing=10,
+            scroll=ft.ScrollMode.AUTO,
+        )
+    )
+
+    if not has_ffprobe:
+        append_log(
+            "ffprobe не найден — метаданные видео будут браться "
+            "из времени изменения файла",
+            "warn",
+        )
 
 
 if __name__ == "__main__":
-    main()
+    ft.run(main)
