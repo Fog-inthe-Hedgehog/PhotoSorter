@@ -54,8 +54,12 @@ jobs:
           poetry install --no-interaction --with dev --no-root
 
       - name: Build Windows executable with Flet
+        shell: pwsh
         run: |
-          poetry run flet build windows -o dist/flet-windows --skip-flutter-doctor --yes
+          $env:PYTHONIOENCODING = "utf-8"
+          $env:TERM = "dumb"
+          $env:FORCE_COLOR = "0"
+          poetry run flet build windows -o dist/flet-windows --skip-flutter-doctor --yes --no-rich-output
 
       - name: Locate Windows EXE
         shell: pwsh
