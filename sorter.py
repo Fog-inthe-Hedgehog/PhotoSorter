@@ -508,10 +508,6 @@ class PhotoSorter:
                     shutil.copy2(file_path, new_file_path)
                     processed += 1
                     self.set_progress(processed, total, error_count)
-                    if folder_name == UNSORTED_DIR_NAME:
-                        self.log(f"Без устройства → {new_file_path}", "warn")
-                    else:
-                        self.log(f"OK {file_path.name} → {new_file_path}", "ok")
                 except Exception as exc:
                     self.log(f"Ошибка сортировки {file_path}: {exc}", "warn")
                     fallback = self.copy_fallback(

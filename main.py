@@ -324,9 +324,18 @@ def main(page: ft.Page) -> None:
                 selectable=True,
             )
         )
+        # Ограничиваем список логов, чтобы избежать замедления UI при большом количестве ошибок
+        if len(log_list.controls) > 1000:
+            log_list.controls.pop(0)
 
     def _apply_progress(processed: int, total: int, errors: int) -> None:
-        progress_bar.value = (processed / total) if total else 0
+        # Защита от деления на ноль и переполнения
+        if total <= 0:
+            progress_bar.value = 0
+        else:
+            # Убедимся, что processed не больше total (страховка)
+            safe_processed = min(processed, total)
+            progress_bar.value = safe_processed / total
         status_text.value = f"Обработано {processed} / {total} · ошибок: {errors}"
 
     async def flush_ui(*, force: bool = False) -> None:
@@ -336,16 +345,27 @@ def main(page: ft.Page) -> None:
         if not force and not pending_logs and pending_progress is None:
             return
 
-        if pending_logs:
-            for msg, level in pending_logs:
-                _append_log_control(msg, level)
-            pending_logs = []
+        try:
+            if pending_logs:
+                for msg, level in pending_logs:
+                    try:
+                        _append_log_control(msg, level)
+                    except Exception as e:
+                        # Если ошибка при добавлении лога, логируем её отдельно
+                        print(f"Ошибка при добавлении лога: {e}")
+                pending_logs = []
 
-        if pending_progress is not None:
-            _apply_progress(*pending_progress)
-            pending_progress = None
+            if pending_progress is not None:
+                try:
+                    _apply_progress(*pending_progress)
+                except Exception as e:
+                    print(f"Ошибка при обновлении прогресса: {e}")
+                pending_progress = None
 
-        page.update()
+            page.update()
+        except Exception as e:
+            # Страховка: если даже page.update() выбросит ошибку
+            print(f"Критическая ошибка при обновлении UI: {e}")
 
     def schedule_flush() -> None:
         nonlocal flush_task
