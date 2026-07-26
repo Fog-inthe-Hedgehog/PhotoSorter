@@ -286,6 +286,14 @@ def main(page: ft.Page) -> None:
             padding=ft.Padding.symmetric(horizontal=16, vertical=14),
         ),
     )
+    avoid_duplicates_cb = ft.Checkbox(
+        label="Избегать дублирования",
+        value=False,
+        tooltip=(
+            "В папках устройств пропускать файл, если имя уже занято. "
+            f"Для «{UNSORTED_DIR_NAME}» по-прежнему добавляется суффикс _1, _2…"
+        ),
+    )
     browse_dest_btn = ft.OutlinedButton("Обзор…", icon=ft.Icons.FOLDER_OPEN)
     browse_source_btn = ft.OutlinedButton("Обзор…", icon=ft.Icons.FOLDER_OPEN)
 
@@ -427,6 +435,7 @@ def main(page: ft.Page) -> None:
         browse_source_btn.disabled = busy
         clear_btn.disabled = busy
         save_log_btn.disabled = busy
+        avoid_duplicates_cb.disabled = busy
         drop_zone.disabled = busy
         drop_target.disabled = busy
         dest_field.disabled = busy
@@ -646,6 +655,7 @@ def main(page: ft.Page) -> None:
                 on_log=enqueue_log,
                 on_progress=enqueue_progress,
                 cancel_check=cancel_event.is_set,
+                avoid_duplicates=bool(avoid_duplicates_cb.value),
             )
             return sorter.sort_files(source_path, dest_path)
 
@@ -725,6 +735,7 @@ def main(page: ft.Page) -> None:
                 ft.Container(height=4),
                 progress_bar,
                 status_text,
+                avoid_duplicates_cb,
                 ft.Row(
                     [start_btn, cancel_btn, save_log_btn, clear_btn],
                     spacing=10,

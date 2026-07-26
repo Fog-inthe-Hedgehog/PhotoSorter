@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -18,6 +19,7 @@ from sorter import (
     parse_video_datetime,
     paths_overlap,
     read_jpeg_exif_bytes,
+    reserve_unique_path,
     safe_name,
     unique_path,
 )
@@ -129,6 +131,17 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(out.parent.name, "Pixel 7")
             self.assertEqual(out.parent.parent.name, "2024")
 
+    def test_reserve_unique_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "photo.jpg"
+            first = reserve_unique_path(target)
+            self.assertEqual(first, target)
+            self.assertTrue(first.exists())
+            second = reserve_unique_path(target)
+            self.assertEqual(second.name, "photo_1.jpg")
+            self.assertTrue(second.exists())
+
     def test_cancel_stops_sort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -136,7 +149,7 @@ class HelperTests(unittest.TestCase):
             dest = root / "dest"
             src.mkdir()
             dest.mkdir()
-            for i in range(3):
+            for i in range(20):
                 (src / f"f{i}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
 
             cancel = {"flag": False}
@@ -144,19 +157,116 @@ class HelperTests(unittest.TestCase):
             def check() -> bool:
                 return cancel["flag"]
 
-            calls = {"n": 0}
-
             def on_progress(p: int, t: int, e: int) -> None:
-                calls["n"] += 1
                 if p >= 1:
                     cancel["flag"] = True
 
-            sorter = PhotoSorter(on_progress=on_progress, cancel_check=check)
+            sorter = PhotoSorter(
+                on_progress=on_progress,
+                cancel_check=check,
+                workers=4,
+            )
             success, processed, total, errors = sorter.sort_files(str(src), str(dest))
             self.assertFalse(success)
-            self.assertEqual(total, 3)
+            self.assertEqual(total, 20)
             self.assertLess(processed, total)
             self.assertEqual(errors, 0)
+
+    def test_parallel_unique_destination_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dest = root / "dest"
+            src.mkdir()
+            dest.mkdir()
+            shared_mtime = 1_700_000_000
+            for i in range(8):
+                path = src / f"f{i}.jpg"
+                path.write_bytes(b"\xff\xd8\xff\xd9" + bytes([i]))
+                os.utime(path, (shared_mtime, shared_mtime))
+
+            sorter = PhotoSorter(workers=4)
+            success, processed, total, errors = sorter.sort_files(str(src), str(dest))
+            self.assertTrue(success)
+            self.assertEqual(processed, 8)
+            self.assertEqual(total, 8)
+            self.assertEqual(errors, 0)
+
+            copied = list(dest.rglob("*.jpg"))
+            self.assertEqual(len(copied), 8)
+            self.assertEqual(len({p.resolve() for p in copied}), 8)
+            payloads = sorted(p.read_bytes() for p in copied)
+            expected = sorted(b"\xff\xd8\xff\xd9" + bytes([i]) for i in range(8))
+            self.assertEqual(payloads, expected)
+
+    def test_avoid_duplicates_skips_known_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dest = root / "dest"
+            src.mkdir()
+            dest.mkdir()
+            shared_mtime = 1_700_000_000
+            for i in range(3):
+                path = src / f"f{i}.jpg"
+                path.write_bytes(b"\xff\xd8\xff\xd9" + bytes([i]))
+                os.utime(path, (shared_mtime, shared_mtime))
+
+            def fake_meta(self, file_path: Path) -> dict:
+                return {
+                    "datetime": datetime(2024, 1, 1, 12, 0, 0),
+                    "device": "Pixel 7",
+                    "year": "2024",
+                    "filename": "2024-01-01_12-00-00.jpg",
+                }
+
+            logs: list[str] = []
+
+            with mock.patch.object(PhotoSorter, "get_metadata", fake_meta):
+                sorter = PhotoSorter(
+                    workers=2,
+                    avoid_duplicates=True,
+                    on_log=lambda msg, _lvl: logs.append(msg),
+                )
+                success, processed, total, errors = sorter.sort_files(
+                    str(src), str(dest)
+                )
+
+            self.assertTrue(success)
+            self.assertEqual(total, 3)
+            self.assertEqual(processed, 3)
+            self.assertEqual(errors, 0)
+            copied = list(dest.rglob("*.jpg"))
+            self.assertEqual(len(copied), 1)
+            self.assertEqual(copied[0].name, "2024-01-01_12-00-00.jpg")
+            self.assertEqual(copied[0].parent.name, "Pixel 7")
+            self.assertTrue(any("дубликат" in msg for msg in logs))
+
+    def test_avoid_duplicates_renames_unknown_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dest = root / "dest"
+            src.mkdir()
+            dest.mkdir()
+            shared_mtime = 1_700_000_000
+            for i in range(3):
+                path = src / f"f{i}.jpg"
+                path.write_bytes(b"\xff\xd8\xff\xd9" + bytes([i]))
+                os.utime(path, (shared_mtime, shared_mtime))
+
+            sorter = PhotoSorter(workers=2, avoid_duplicates=True)
+            success, processed, total, errors = sorter.sort_files(str(src), str(dest))
+            self.assertTrue(success)
+            self.assertEqual(processed, 3)
+            self.assertEqual(total, 3)
+            self.assertEqual(errors, 0)
+
+            copied = list(dest.rglob("*.jpg"))
+            self.assertEqual(len(copied), 3)
+            self.assertTrue(all(p.parent.name == UNSORTED_DIR_NAME for p in copied))
+            names = sorted(p.name for p in copied)
+            self.assertEqual(len(set(names)), 3)
 
 
 if __name__ == "__main__":

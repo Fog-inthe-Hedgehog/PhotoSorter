@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -136,6 +139,27 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def reserve_unique_path(path: Path) -> Path:
+    """Atomically claim a unique path by creating an empty placeholder file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stem, suffix = path.stem, path.suffix
+    counter = 0
+    while True:
+        candidate = (
+            path if counter == 0 else path.with_name(f"{stem}_{counter}{suffix}")
+        )
+        try:
+            fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return candidate
+        except FileExistsError:
+            counter += 1
+
+
+def default_worker_count() -> int:
+    return min(8, max(4, os.cpu_count() or 4))
 
 
 def paths_overlap(source: Path, dest: Path) -> bool:
@@ -290,12 +314,17 @@ class PhotoSorter:
         on_log: LogFn | None = None,
         on_progress: ProgressFn | None = None,
         cancel_check: CancelFn | None = None,
+        workers: int | None = None,
+        avoid_duplicates: bool = False,
     ):
         self.on_log = on_log or (lambda _msg, _level: None)
         self.on_progress = on_progress or (lambda _p, _t, _e: None)
         self.cancel_check = cancel_check or (lambda: False)
+        self.workers = workers
+        self.avoid_duplicates = avoid_duplicates
         self.supported_extensions = SUPPORTED_EXTENSIONS
         self._has_ffprobe = ffprobe_available()
+        self._dest_lock = threading.Lock()
 
     def log(self, message: str, level: str = "info") -> None:
         self.on_log(message, level)
@@ -408,6 +437,27 @@ class PhotoSorter:
             capture_dt, device = self.extract_image_capture_info(file_path)
         return build_result(file_path, capture_dt, device)
 
+    def claim_destination(
+        self,
+        folder: Path,
+        filename: str,
+        *,
+        known_device: bool,
+    ) -> Path | None:
+        """Reserve destination path. Returns None when skipping a device duplicate."""
+        target = folder / filename
+        with self._dest_lock:
+            if self.avoid_duplicates and known_device:
+                try:
+                    fd = os.open(
+                        str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                    )
+                    os.close(fd)
+                    return target
+                except FileExistsError:
+                    return None
+            return reserve_unique_path(target)
+
     def copy_fallback(
         self,
         file_path: Path,
@@ -427,7 +477,8 @@ class PhotoSorter:
                 f"{mod_dt.strftime('%Y-%m-%d_%H-%M-%S')}{file_path.suffix.lower()}",
                 fallback="file",
             )
-            new_file_path = unique_path(folder / filename)
+            with self._dest_lock:
+                new_file_path = reserve_unique_path(folder / filename)
             shutil.copy2(file_path, new_file_path)
             return new_file_path
         except Exception as exc:
@@ -460,13 +511,29 @@ class PhotoSorter:
             found.append(path)
         return found
 
-    def sort_files(self, source_dir: str, dest_dir: str) -> tuple[bool, int, int, int]:
+    def sort_files(
+        self,
+        source_dir: str,
+        dest_dir: str,
+        workers: int | None = None,
+        avoid_duplicates: bool | None = None,
+    ) -> tuple[bool, int, int, int]:
         """Returns (success, processed, total, error_count). success iff error_count == 0."""
         source_path = Path(source_dir)
         dest_path = Path(dest_dir)
         processed = 0
         error_count = 0
+        skipped = 0
         total = 0
+
+        if workers is None:
+            workers = self.workers
+        if workers is None:
+            workers = default_worker_count()
+        workers = max(1, int(workers))
+
+        if avoid_duplicates is not None:
+            self.avoid_duplicates = bool(avoid_duplicates)
 
         try:
             if not source_path.exists():
@@ -499,34 +566,77 @@ class PhotoSorter:
                 )
                 return False, 0, 0, 0
 
-            self.log(f"Найдено {total} файлов для обработки", "info")
+            dup_note = (
+                " · без дубликатов устройств"
+                if self.avoid_duplicates
+                else ""
+            )
+            self.log(
+                f"Найдено {total} файлов для обработки · потоков: {workers}{dup_note}",
+                "info",
+            )
             self.set_progress(0, total, 0)
 
-            for file_path in files_to_process:
+            progress_lock = threading.Lock()
+            was_cancelled = False
+
+            def bump(ok: bool, *, skipped_dup: bool = False) -> None:
+                nonlocal processed, error_count, skipped
+                with progress_lock:
+                    if ok:
+                        processed += 1
+                        if skipped_dup:
+                            skipped += 1
+                    else:
+                        error_count += 1
+                    self.set_progress(processed, total, error_count)
+
+            def process_one(file_path: Path) -> None:
                 if self.cancelled():
-                    self.log(
-                        f"Сортировка отменена · обработано {processed} из {total}",
-                        "warn",
-                    )
-                    return False, processed, total, error_count
+                    return
 
                 year_hint: str | None = None
                 device_hint: str | None = None
+                reserved: Path | None = None
                 try:
                     metadata = self.get_metadata(file_path)
+                    if self.cancelled():
+                        return
                     year_hint = metadata["year"]
                     device_hint = metadata["device"]
                     folder_name = device_folder_name(device_hint)
+                    known_device = folder_name != UNSORTED_DIR_NAME
                     device_folder = dest_path / year_hint / folder_name
                     device_folder.mkdir(parents=True, exist_ok=True)
 
                     new_filename = safe_name(metadata["filename"], fallback="file")
-                    new_file_path = unique_path(device_folder / new_filename)
+                    reserved = self.claim_destination(
+                        device_folder,
+                        new_filename,
+                        known_device=known_device,
+                    )
+                    if reserved is None:
+                        self.log(
+                            f"Пропуск (дубликат): {file_path.name} → "
+                            f"{year_hint}/{folder_name}/{new_filename}",
+                            "warn",
+                        )
+                        bump(True, skipped_dup=True)
+                        return
 
-                    shutil.copy2(file_path, new_file_path)
-                    processed += 1
-                    self.set_progress(processed, total, error_count)
+                    if self.cancelled():
+                        reserved.unlink(missing_ok=True)
+                        return
+
+                    shutil.copy2(file_path, reserved)
+                    reserved = None
+                    bump(True)
                 except Exception as exc:
+                    if reserved is not None:
+                        try:
+                            reserved.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                     self.log(f"Ошибка сортировки {file_path}: {exc}", "warn")
                     fallback = self.copy_fallback(
                         file_path,
@@ -535,14 +645,49 @@ class PhotoSorter:
                         device=device_hint,
                     )
                     if fallback is not None:
-                        processed += 1
-                        self.set_progress(processed, total, error_count)
+                        bump(True)
                         self.log(f"Восстановлено → {fallback}", "warn")
                     else:
-                        error_count += 1
-                        self.set_progress(processed, total, error_count)
+                        bump(False)
 
-            if self.cancelled():
+            if workers == 1:
+                for file_path in files_to_process:
+                    if self.cancelled():
+                        was_cancelled = True
+                        break
+                    process_one(file_path)
+            else:
+                pending: set = set()
+                file_iter = iter(files_to_process)
+                executor = ThreadPoolExecutor(max_workers=workers)
+                try:
+
+                    def submit_available() -> None:
+                        nonlocal was_cancelled
+                        while len(pending) < workers:
+                            if self.cancelled():
+                                was_cancelled = True
+                                return
+                            try:
+                                next_file = next(file_iter)
+                            except StopIteration:
+                                return
+                            pending.add(executor.submit(process_one, next_file))
+
+                    submit_available()
+                    while pending:
+                        if self.cancelled():
+                            was_cancelled = True
+                            break
+                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            future.result()
+                        if not was_cancelled:
+                            submit_available()
+                finally:
+                    executor.shutdown(wait=True, cancel_futures=was_cancelled)
+
+            if was_cancelled or self.cancelled():
                 self.log(
                     f"Сортировка отменена · обработано {processed} из {total}",
                     "warn",
@@ -550,9 +695,14 @@ class PhotoSorter:
                 return False, processed, total, error_count
 
             success = error_count == 0
+            extra = ""
+            if error_count:
+                extra += f", ошибок: {error_count}"
+            if skipped:
+                extra += f", пропущено дубликатов: {skipped}"
             self.log(
                 f"Сортировка завершена! Обработано {processed} из {total} файлов"
-                + (f", ошибок: {error_count}" if error_count else ""),
+                + extra,
                 "ok" if success else "error",
             )
             return success, processed, total, error_count
