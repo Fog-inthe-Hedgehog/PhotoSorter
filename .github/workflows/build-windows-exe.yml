@@ -51,7 +51,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          poetry install --no-interaction --with dev --no-root
+          poetry install --no-interaction --with dev
 
       - name: Build Windows executable with Flet
         shell: pwsh
