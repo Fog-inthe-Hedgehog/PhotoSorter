@@ -21,6 +21,12 @@ jobs:
           python-version: '3.13'
           cache: 'pip'
 
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.7'
+
       - name: Install Poetry
         run: |
           python -m pip install --upgrade pip
@@ -30,7 +36,15 @@ jobs:
         run: |
           choco install ffmpeg --no-progress -y
 
-      - name: Configure Poetry virtualenv
+      - name: Prepare ffprobe binary
+        shell: pwsh
+        run: |
+          $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
+          if ($ffprobe) {
+            Copy-Item $ffprobe.Source -Destination ffprobe.exe -Force
+          }
+
+      - name: Configure Poetry
         run: |
           poetry config virtualenvs.in-project true
           poetry env use python
@@ -39,13 +53,21 @@ jobs:
         run: |
           poetry install --no-interaction --with dev --no-root
 
-      - name: Build Windows executable
+      - name: Build Windows executable with Flet
         run: |
-          poetry run pyinstaller --noconfirm --clean --distpath dist/exe --workpath build/pyinstaller photosorter.spec
+          poetry run flet build windows -o dist/flet-windows --skip-flutter-doctor --yes
+
+      - name: Locate Windows EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/flet-windows-output | Out-Null
+          $exe = Get-ChildItem -Path . -Recurse -Filter "PhotoSorter.exe" | Select-Object -First 1 -Expand FullName
+          if (-not $exe) { throw "PhotoSorter.exe not found" }
+          Copy-Item $exe -Destination dist/flet-windows-output/PhotoSorter.exe
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: PhotoSorter-Windows-EXE
-          path: dist/exe/PhotoSorter.exe
+          path: dist/flet-windows-output/PhotoSorter.exe
           if-no-files-found: error

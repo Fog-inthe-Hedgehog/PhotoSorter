@@ -199,7 +199,6 @@ def main(page: ft.Page) -> None:
             on_drop_exited()
             return
 
-        # Some desktops report a path that exists only after resolve
         resolved = path.resolve() if path.exists() else path
         if resolved.is_dir():
             set_source(str(resolved))

@@ -7,9 +7,8 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 block_cipher = None
 
 hiddenimports = [
-    "flet_dropzone",
     "flet_desktop",
-] + collect_submodules("flet") + collect_submodules("flet_desktop") + collect_submodules("flet_dropzone")
+] + collect_submodules("flet") + collect_submodules("flet_desktop")
 
 flet_datas = collect_data_files("flet")
 

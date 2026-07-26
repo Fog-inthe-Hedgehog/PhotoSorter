@@ -156,6 +156,11 @@ def get_ffprobe_path() -> str | None:
     global _ffprobe_cached, _ffprobe_path
     if _ffprobe_cached is None:
         ffprobe_path = shutil.which("ffprobe")
+        if not ffprobe_path:
+            app_dir = Path(__file__).resolve().parent
+            bundled = app_dir / ("ffprobe.exe" if sys.platform.startswith("win") else "ffprobe")
+            if bundled.exists():
+                ffprobe_path = str(bundled)
         if not ffprobe_path and getattr(sys, "_MEIPASS", None):
             bundled = Path(sys._MEIPASS) / ("ffprobe.exe" if sys.platform.startswith("win") else "ffprobe")
             if bundled.exists():
