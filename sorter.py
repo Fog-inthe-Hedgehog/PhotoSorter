@@ -58,7 +58,7 @@ EXIF_DATE_TAGS = (
 )
 
 LogFn = Callable[[str, str], None]
-ProgressFn = Callable[[int, int, int], None]
+ProgressFn = Callable[[int, int, int, int], None]
 CancelFn = Callable[[], bool]
 
 _ffprobe_cached: bool | None = None
@@ -318,7 +318,7 @@ class PhotoSorter:
         avoid_duplicates: bool = False,
     ):
         self.on_log = on_log or (lambda _msg, _level: None)
-        self.on_progress = on_progress or (lambda _p, _t, _e: None)
+        self.on_progress = on_progress or (lambda _p, _t, _e, _s: None)
         self.cancel_check = cancel_check or (lambda: False)
         self.workers = workers
         self.avoid_duplicates = avoid_duplicates
@@ -329,8 +329,14 @@ class PhotoSorter:
     def log(self, message: str, level: str = "info") -> None:
         self.on_log(message, level)
 
-    def set_progress(self, processed: int, total: int, error_count: int = 0) -> None:
-        self.on_progress(processed, total, error_count)
+    def set_progress(
+        self,
+        processed: int,
+        total: int,
+        error_count: int = 0,
+        skipped: int = 0,
+    ) -> None:
+        self.on_progress(processed, total, error_count, skipped)
 
     def cancelled(self) -> bool:
         try:
@@ -517,8 +523,8 @@ class PhotoSorter:
         dest_dir: str,
         workers: int | None = None,
         avoid_duplicates: bool | None = None,
-    ) -> tuple[bool, int, int, int]:
-        """Returns (success, processed, total, error_count). success iff error_count == 0."""
+    ) -> tuple[bool, int, int, int, int]:
+        """Returns (success, processed, total, error_count, skipped)."""
         source_path = Path(source_dir)
         dest_path = Path(dest_dir)
         processed = 0
@@ -538,7 +544,7 @@ class PhotoSorter:
         try:
             if not source_path.exists():
                 self.log(f"Ошибка: папка {source_dir} не существует", "error")
-                return False, 0, 0, 1
+                return False, 0, 0, 1, 0
 
             dest_path.mkdir(parents=True, exist_ok=True)
             dest_resolved = dest_path.resolve()
@@ -564,7 +570,7 @@ class PhotoSorter:
                     "Не найдено поддерживаемых файлов в указанной папке",
                     "warn",
                 )
-                return False, 0, 0, 0
+                return False, 0, 0, 0, 0
 
             dup_note = (
                 " · без дубликатов устройств"
@@ -575,7 +581,7 @@ class PhotoSorter:
                 f"Найдено {total} файлов для обработки · потоков: {workers}{dup_note}",
                 "info",
             )
-            self.set_progress(0, total, 0)
+            self.set_progress(0, total, 0, 0)
 
             progress_lock = threading.Lock()
             was_cancelled = False
@@ -589,7 +595,7 @@ class PhotoSorter:
                             skipped += 1
                     else:
                         error_count += 1
-                    self.set_progress(processed, total, error_count)
+                    self.set_progress(processed, total, error_count, skipped)
 
             def process_one(file_path: Path) -> None:
                 if self.cancelled():
@@ -689,10 +695,11 @@ class PhotoSorter:
 
             if was_cancelled or self.cancelled():
                 self.log(
-                    f"Сортировка отменена · обработано {processed} из {total}",
+                    f"Сортировка отменена · обработано {processed} из {total}"
+                    + (f", дубликатов: {skipped}" if skipped else ""),
                     "warn",
                 )
-                return False, processed, total, error_count
+                return False, processed, total, error_count, skipped
 
             success = error_count == 0
             extra = ""
@@ -705,8 +712,8 @@ class PhotoSorter:
                 + extra,
                 "ok" if success else "error",
             )
-            return success, processed, total, error_count
+            return success, processed, total, error_count, skipped
         except Exception as exc:
             error_count += 1
             self.log(f"Критическая ошибка сортировки: {exc}", "error")
-            return False, processed, total, error_count
+            return False, processed, total, error_count, skipped

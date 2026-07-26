@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
+import sys
 import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import TextIO
 
 import flet as ft
 import flet_dropzone as ftd
@@ -43,7 +46,14 @@ LOG_COLORS = {
 }
 
 # Coalesce worker UI updates onto the event loop (ms).
-UI_BATCH_MS = 100
+UI_BATCH_MS = 150
+# Keep only a small ring in the on-screen log; full history goes to the file.
+UI_LOG_MAX = 80
+UI_PENDING_LOG_MAX = 40
+# Flush log file every N lines (avoid lock+fsync per message from worker threads).
+LOG_FLUSH_EVERY = 64
+# Duplicate skips go to the file only — not the UI ring (too chatty).
+_UI_SKIP_PREFIXES = ("Пропуск (дубликат):",)
 
 
 def shorten_path(path: str, max_len: int = 64) -> str:
@@ -100,10 +110,18 @@ def main(page: ft.Page) -> None:
     is_sorting = False
     has_ffprobe = ffprobe_available()
 
-    # Batched UI state (mutated only on the asyncio loop)
-    pending_logs: list[tuple[str, str]] = []
-    pending_progress: tuple[int, int, int] | None = None
+    # Batched UI state — workers write under ui_lock; event loop drains on a timer.
+    ui_lock = threading.Lock()
+    pending_logs: deque[tuple[str, str]] = deque(maxlen=UI_PENDING_LOG_MAX)
+    pending_progress: tuple[int, int, int, int] | None = None
     flush_task: asyncio.Task | None = None
+    flush_scheduled = False
+
+    # Full log streams to disk; UI shows a short ring buffer only.
+    session_log_path: Path | None = None
+    session_log_fp: TextIO | None = None
+    session_log_lock = threading.Lock()
+    log_lines_since_flush = 0
 
     dest_field = ft.TextField(
         label="Папка сохранения",
@@ -279,8 +297,8 @@ def main(page: ft.Page) -> None:
         ),
     )
     save_log_btn = ft.OutlinedButton(
-        "Сохранить лог",
-        icon=ft.Icons.SAVE_OUTLINED,
+        "Открыть лог",
+        icon=ft.Icons.FOLDER_OPEN,
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10),
             padding=ft.Padding.symmetric(horizontal=16, vertical=14),
@@ -319,6 +337,57 @@ def main(page: ft.Page) -> None:
             )
         )
 
+    def close_session_log() -> None:
+        nonlocal session_log_fp, session_log_path, log_lines_since_flush
+        with session_log_lock:
+            if session_log_fp is not None:
+                try:
+                    session_log_fp.flush()
+                    session_log_fp.close()
+                except OSError:
+                    pass
+                session_log_fp = None
+            log_lines_since_flush = 0
+
+    def open_session_log(dest_dir: Path) -> Path:
+        """Create a new session log file in dest_dir and start streaming to it."""
+        nonlocal session_log_fp, session_log_path, log_lines_since_flush
+        close_session_log()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path = dest_dir / f"photosorter_{stamp}.log"
+        # Larger buffer: many worker threads must not flush on every line.
+        fp = open(path, "w", encoding="utf-8", buffering=1024 * 64)
+        with session_log_lock:
+            session_log_fp = fp
+            session_log_path = path
+            log_lines_since_flush = 0
+        write_log_line(f"=== Photo Sorter log · {path} ===", "info")
+        return path
+
+    def write_log_line(message: str, level: str = "info") -> None:
+        """Append one line to the session log file (thread-safe, streamed)."""
+        nonlocal log_lines_since_flush
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tag = level if level in LOG_COLORS else "info"
+        line = f"[{stamp}] [{tag}] {message}\n"
+        with session_log_lock:
+            if session_log_fp is None:
+                return
+            try:
+                session_log_fp.write(line)
+                log_lines_since_flush += 1
+                if log_lines_since_flush >= LOG_FLUSH_EVERY:
+                    session_log_fp.flush()
+                    log_lines_since_flush = 0
+            except OSError as exc:
+                print(f"Ошибка записи лога: {exc}")
+
+    def _trim_ui_log() -> None:
+        overflow = len(log_list.controls) - UI_LOG_MAX
+        if overflow > 0:
+            del log_list.controls[:overflow]
+
     def _append_log_control(message: str, level: str = "info") -> None:
         tag = level if level in LOG_COLORS else "info"
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -331,50 +400,39 @@ def main(page: ft.Page) -> None:
                 selectable=True,
             )
         )
-        # Ограничиваем список логов, чтобы избежать замедления UI при большом количестве ошибок
-        if len(log_list.controls) > 1000:
-            log_list.controls.pop(0)
+        _trim_ui_log()
 
-    def _apply_progress(processed: int, total: int, errors: int) -> None:
-        # Защита от деления на ноль и переполнения
+    def _dup_status_suffix(skipped: int) -> str:
+        if avoid_duplicates_cb.value:
+            return f" · дубликатов: {skipped}"
+        return ""
+
+    def _apply_progress(
+        processed: int, total: int, errors: int, skipped: int = 0
+    ) -> None:
         if total <= 0:
             progress_bar.value = 0
         else:
-            # Убедимся, что processed не больше total (страховка)
             safe_processed = min(processed, total)
             progress_bar.value = safe_processed / total
-        status_text.value = f"Обработано {processed} / {total} · ошибок: {errors}"
+        status_text.value = (
+            f"Обработано {processed} / {total} · ошибок: {errors}"
+            + _dup_status_suffix(skipped)
+        )
 
-    async def flush_ui(*, force: bool = False) -> None:
-        """Apply buffered log/progress and call page.update once (event loop only)."""
-        nonlocal pending_logs, pending_progress, flush_task
-        flush_task = None
-        if not force and not pending_logs and pending_progress is None:
-            return
+    def _show_in_ui_log(message: str) -> bool:
+        return not message.startswith(_UI_SKIP_PREFIXES)
 
-        try:
-            if pending_logs:
-                for msg, level in pending_logs:
-                    try:
-                        _append_log_control(msg, level)
-                    except Exception as e:
-                        # Если ошибка при добавлении лога, логируем её отдельно
-                        print(f"Ошибка при добавлении лога: {e}")
-                pending_logs = []
+    def request_ui_flush() -> None:
+        """Schedule at most one UI flush; safe to call from worker threads."""
+        nonlocal flush_scheduled
+        with ui_lock:
+            if flush_scheduled:
+                return
+            flush_scheduled = True
+        loop.call_soon_threadsafe(_arm_flush)
 
-            if pending_progress is not None:
-                try:
-                    _apply_progress(*pending_progress)
-                except Exception as e:
-                    print(f"Ошибка при обновлении прогресса: {e}")
-                pending_progress = None
-
-            page.update()
-        except Exception as e:
-            # Страховка: если даже page.update() выбросит ошибку
-            print(f"Критическая ошибка при обновлении UI: {e}")
-
-    def schedule_flush() -> None:
+    def _arm_flush() -> None:
         nonlocal flush_task
         if flush_task is None or flush_task.done():
             flush_task = loop.create_task(_delayed_flush())
@@ -383,27 +441,65 @@ def main(page: ft.Page) -> None:
         await asyncio.sleep(UI_BATCH_MS / 1000)
         await flush_ui()
 
+    async def flush_ui(*, force: bool = False) -> None:
+        """Drain coalesced log/progress and call page.update once (event loop only)."""
+        nonlocal pending_progress, flush_task, flush_scheduled
+        flush_task = None
+
+        with ui_lock:
+            logs = list(pending_logs)
+            pending_logs.clear()
+            progress = pending_progress
+            pending_progress = None
+            flush_scheduled = False
+
+        if not force and not logs and progress is None:
+            return
+
+        try:
+            for msg, level in logs:
+                try:
+                    _append_log_control(msg, level)
+                except Exception as e:
+                    print(f"Ошибка при добавлении лога: {e}")
+
+            if progress is not None:
+                try:
+                    _apply_progress(*progress)
+                except Exception as e:
+                    print(f"Ошибка при обновлении прогресса: {e}")
+
+            page.update()
+        except Exception as e:
+            print(f"Критическая ошибка при обновлении UI: {e}")
+
+        # Workers may have queued more while we were updating.
+        with ui_lock:
+            more = bool(pending_logs) or pending_progress is not None
+        if more:
+            request_ui_flush()
+
     def enqueue_log(message: str, level: str = "info") -> None:
-        """Thread-safe: hop log onto the asyncio loop (batched)."""
-
-        def _enqueue() -> None:
+        """Stream to file immediately; coalesce UI updates (no per-line call_soon flood)."""
+        write_log_line(message, level)
+        if not _show_in_ui_log(message):
+            return
+        with ui_lock:
             pending_logs.append((message, level))
-            schedule_flush()
+        request_ui_flush()
 
-        loop.call_soon_threadsafe(_enqueue)
-
-    def enqueue_progress(processed: int, total: int, errors: int) -> None:
-        """Thread-safe: hop progress onto the asyncio loop (coalesced)."""
-
-        def _enqueue() -> None:
-            nonlocal pending_progress
-            pending_progress = (processed, total, errors)
-            schedule_flush()
-
-        loop.call_soon_threadsafe(_enqueue)
+    def enqueue_progress(
+        processed: int, total: int, errors: int, skipped: int = 0
+    ) -> None:
+        """Coalesce progress under a lock; one scheduled UI flush at a time."""
+        nonlocal pending_progress
+        with ui_lock:
+            pending_progress = (processed, total, errors, skipped)
+        request_ui_flush()
 
     def append_log(message: str, level: str = "info") -> None:
         """Immediate log from the UI/event-loop thread."""
+        write_log_line(message, level)
         _append_log_control(message, level)
         page.update()
 
@@ -434,7 +530,6 @@ def main(page: ft.Page) -> None:
         browse_dest_btn.disabled = busy
         browse_source_btn.disabled = busy
         clear_btn.disabled = busy
-        save_log_btn.disabled = busy
         avoid_duplicates_cb.disabled = busy
         drop_zone.disabled = busy
         drop_target.disabled = busy
@@ -522,45 +617,31 @@ def main(page: ft.Page) -> None:
         log_list.controls.clear()
         page.update()
 
-    def save_log(_e=None) -> None:
-        nonlocal pending_logs
-        dest = (dest_field.value or dest_path or "").strip()
-        if not dest:
+    def open_log(_e=None) -> None:
+        path = session_log_path
+        if path is None or not path.exists():
             show_dialog(
-                "Предупреждение",
-                "Сначала укажите папку сохранения для фотографий",
+                "Лог",
+                "Файл лога ещё не создан.\n"
+                "Он создаётся в папке сохранения при запуске сортировки.",
             )
             return
 
-        dest_dir = Path(dest)
-        if pending_logs:
-            for msg, level in pending_logs:
-                _append_log_control(msg, level)
-            pending_logs = []
-
-        lines = [
-            ctrl.value
-            for ctrl in log_list.controls
-            if isinstance(ctrl, ft.Text) and ctrl.value
-        ]
-        if not lines:
-            show_dialog("Предупреждение", "Лог пуст — нечего сохранять")
-            return
-
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out_path = dest_dir / f"photosorter_{stamp}.log"
         try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            if sys.platform.startswith("darwin"):
+                subprocess.run(["open", "-R", str(path)], check=False)
+            elif sys.platform.startswith("win"):
+                subprocess.run(
+                    ["explorer", f"/select,{path}"],
+                    check=False,
+                )
+            else:
+                subprocess.run(["xdg-open", str(path)], check=False)
         except OSError as exc:
-            show_dialog("Ошибка", f"Не удалось сохранить лог:\n{exc}")
+            show_dialog("Ошибка", f"Не удалось открыть лог:\n{exc}")
             return
 
-        append_log(f"Лог сохранён: {out_path}", "ok")
-        show_dialog(
-            "Лог сохранён",
-            f"Лог сохранён в выбранную директорию:\n{dest_dir}",
-        )
+        show_dialog("Лог", f"Полный лог пишется в файл:\n{path}")
 
     def request_cancel(_e=None) -> None:
         if not is_sorting:
@@ -572,21 +653,33 @@ def main(page: ft.Page) -> None:
         page.update()
 
     def on_sorting_finished(
-        success: bool, processed: int, total: int, error_count: int
+        success: bool,
+        processed: int,
+        total: int,
+        error_count: int,
+        skipped: int = 0,
     ) -> None:
         nonlocal is_sorting
         was_cancelled = cancel_event.is_set()
         is_sorting = False
         set_controls_busy(False)
+        dup_suffix = _dup_status_suffix(skipped)
+        dup_dialog = (
+            f"\nПропущено дубликатов: {skipped}"
+            if avoid_duplicates_cb.value
+            else ""
+        )
 
         if was_cancelled:
             status_text.value = (
                 f"Отменено · обработано {processed} / {total} · ошибок: {error_count}"
+                + dup_suffix
             )
             page.update()
             show_dialog(
                 "Отменено",
-                f"Сортировка прервана.\nОбработано файлов: {processed} из {total}",
+                f"Сортировка прервана.\nОбработано файлов: {processed} из {total}"
+                + dup_dialog,
             )
         elif total == 0 and error_count == 0:
             status_text.value = "Файлы не найдены · ошибок: 0"
@@ -596,22 +689,26 @@ def main(page: ft.Page) -> None:
             progress_bar.value = 1
             status_text.value = (
                 f"Готово · обработано {processed} / {total} · ошибок: 0"
+                + dup_suffix
             )
             page.update()
             show_dialog(
                 "Готово",
-                f"Сортировка завершена.\nОбработано файлов: {processed} из {total}",
+                f"Сортировка завершена.\nОбработано файлов: {processed} из {total}"
+                + dup_dialog,
             )
         else:
             status_text.value = (
                 f"Завершено · обработано {processed} / {total} · ошибок: {error_count}"
+                + dup_suffix
             )
             page.update()
             show_dialog(
                 "Внимание",
                 f"Сортировка завершена с ошибками.\n"
                 f"Обработано: {processed} из {total}\n"
-                f"Ошибок: {error_count}",
+                f"Ошибок: {error_count}"
+                + dup_dialog,
             )
 
     async def start_sorting(_e=None) -> None:
@@ -647,10 +744,23 @@ def main(page: ft.Page) -> None:
         is_sorting = True
         set_controls_busy(True)
         progress_bar.value = 0
-        status_text.value = "Сортировка начата… · ошибок: 0"
+        status_text.value = (
+            "Сортировка начата… · ошибок: 0"
+            + _dup_status_suffix(0)
+        )
+
+        try:
+            log_path = open_session_log(dst)
+        except OSError as exc:
+            is_sorting = False
+            set_controls_busy(False)
+            show_dialog("Ошибка", f"Не удалось создать файл лога:\n{exc}")
+            return
+
+        append_log(f"Лог: {log_path}", "info")
         append_log("Сортировка запущена", "info")
 
-        def run_sort() -> tuple[bool, int, int, int]:
+        def run_sort() -> tuple[bool, int, int, int, int]:
             sorter = PhotoSorter(
                 on_log=enqueue_log,
                 on_progress=enqueue_progress,
@@ -666,11 +776,13 @@ def main(page: ft.Page) -> None:
             is_sorting = False
             set_controls_busy(False)
             append_log(f"Критическая ошибка: {exc}", "error")
+            close_session_log()
             show_dialog("Ошибка", f"Сортировка прервалась:\n{exc}")
             return
 
         await flush_ui(force=True)
         on_sorting_finished(*result)
+        close_session_log()
 
     browse_source_btn.on_click = pick_source
     browse_dest_btn.on_click = pick_dest
@@ -678,7 +790,7 @@ def main(page: ft.Page) -> None:
     start_btn.on_click = start_sorting
     cancel_btn.on_click = request_cancel
     clear_btn.on_click = clear_log
-    save_log_btn.on_click = save_log
+    save_log_btn.on_click = open_log
     source_field.on_submit = apply_source_field
     dest_field.on_submit = apply_dest_field
     source_field.on_blur = apply_source_field

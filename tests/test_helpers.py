@@ -157,7 +157,7 @@ class HelperTests(unittest.TestCase):
             def check() -> bool:
                 return cancel["flag"]
 
-            def on_progress(p: int, t: int, e: int) -> None:
+            def on_progress(p: int, t: int, e: int, s: int = 0) -> None:
                 if p >= 1:
                     cancel["flag"] = True
 
@@ -166,11 +166,14 @@ class HelperTests(unittest.TestCase):
                 cancel_check=check,
                 workers=4,
             )
-            success, processed, total, errors = sorter.sort_files(str(src), str(dest))
+            success, processed, total, errors, skipped = sorter.sort_files(
+                str(src), str(dest)
+            )
             self.assertFalse(success)
             self.assertEqual(total, 20)
             self.assertLess(processed, total)
             self.assertEqual(errors, 0)
+            self.assertEqual(skipped, 0)
 
     def test_parallel_unique_destination_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,11 +189,14 @@ class HelperTests(unittest.TestCase):
                 os.utime(path, (shared_mtime, shared_mtime))
 
             sorter = PhotoSorter(workers=4)
-            success, processed, total, errors = sorter.sort_files(str(src), str(dest))
+            success, processed, total, errors, skipped = sorter.sort_files(
+                str(src), str(dest)
+            )
             self.assertTrue(success)
             self.assertEqual(processed, 8)
             self.assertEqual(total, 8)
             self.assertEqual(errors, 0)
+            self.assertEqual(skipped, 0)
 
             copied = list(dest.rglob("*.jpg"))
             self.assertEqual(len(copied), 8)
@@ -228,7 +234,7 @@ class HelperTests(unittest.TestCase):
                     avoid_duplicates=True,
                     on_log=lambda msg, _lvl: logs.append(msg),
                 )
-                success, processed, total, errors = sorter.sort_files(
+                success, processed, total, errors, skipped = sorter.sort_files(
                     str(src), str(dest)
                 )
 
@@ -236,6 +242,7 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(total, 3)
             self.assertEqual(processed, 3)
             self.assertEqual(errors, 0)
+            self.assertEqual(skipped, 2)
             copied = list(dest.rglob("*.jpg"))
             self.assertEqual(len(copied), 1)
             self.assertEqual(copied[0].name, "2024-01-01_12-00-00.jpg")
@@ -256,11 +263,14 @@ class HelperTests(unittest.TestCase):
                 os.utime(path, (shared_mtime, shared_mtime))
 
             sorter = PhotoSorter(workers=2, avoid_duplicates=True)
-            success, processed, total, errors = sorter.sort_files(str(src), str(dest))
+            success, processed, total, errors, skipped = sorter.sort_files(
+                str(src), str(dest)
+            )
             self.assertTrue(success)
             self.assertEqual(processed, 3)
             self.assertEqual(total, 3)
             self.assertEqual(errors, 0)
+            self.assertEqual(skipped, 0)
 
             copied = list(dest.rglob("*.jpg"))
             self.assertEqual(len(copied), 3)
