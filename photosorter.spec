@@ -1,13 +1,19 @@
 # -*- mode: python -*-
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
 
+hiddenimports = [
+    "flet_dropzone",
+    "flet_desktop",
+] + collect_submodules("flet_desktop")
 
 a = Analysis(
     ["main.py"],
     pathex=["."],
     binaries=[],
     datas=[("resources", "resources")],
-    hiddenimports=["flet", "flet_dropzone"],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
