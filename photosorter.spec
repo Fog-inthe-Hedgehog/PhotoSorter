@@ -1,4 +1,7 @@
 # -*- mode: python -*-
+import shutil
+import sys
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
@@ -6,14 +9,24 @@ block_cipher = None
 hiddenimports = [
     "flet_dropzone",
     "flet_desktop",
-] + collect_submodules("flet") + collect_submodules("flet_desktop")
+] + collect_submodules("flet") + collect_submodules("flet_desktop") + collect_submodules("flet_dropzone")
 
 flet_datas = collect_data_files("flet")
+
+ffprobe_path = shutil.which("ffprobe")
+if not ffprobe_path and getattr(sys, "_MEIPASS", None):
+    candidate = Path(sys._MEIPASS) / ("ffprobe.exe" if sys.platform.startswith("win") else "ffprobe")
+    if candidate.exists():
+        ffprobe_path = str(candidate)
+
+binaries = []
+if ffprobe_path:
+    binaries.append((ffprobe_path, "."))
 
 a = Analysis(
     ["main.py"],
     pathex=["."],
-    binaries=[],
+    binaries=binaries,
     datas=[("resources", "resources")] + flet_datas,
     hiddenimports=hiddenimports,
     hookspath=[],

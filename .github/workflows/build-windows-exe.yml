@@ -26,6 +26,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install poetry
 
+      - name: Install ffmpeg/ffprobe
+        run: |
+          choco install ffmpeg --no-progress -y
+
       - name: Configure Poetry virtualenv
         run: |
           poetry config virtualenvs.in-project true

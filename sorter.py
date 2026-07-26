@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,7 @@ ProgressFn = Callable[[int, int, int], None]
 CancelFn = Callable[[], bool]
 
 _ffprobe_cached: bool | None = None
+_ffprobe_path: str | None = None
 
 
 def decode_meta_str(value: str | bytes | None) -> str | None:
@@ -150,11 +152,21 @@ def paths_overlap(source: Path, dest: Path) -> bool:
     )
 
 
-def ffprobe_available() -> bool:
-    global _ffprobe_cached
+def get_ffprobe_path() -> str | None:
+    global _ffprobe_cached, _ffprobe_path
     if _ffprobe_cached is None:
-        _ffprobe_cached = shutil.which("ffprobe") is not None
-    return _ffprobe_cached
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffprobe_path and getattr(sys, "_MEIPASS", None):
+            bundled = Path(sys._MEIPASS) / ("ffprobe.exe" if sys.platform.startswith("win") else "ffprobe")
+            if bundled.exists():
+                ffprobe_path = str(bundled)
+        _ffprobe_path = ffprobe_path
+        _ffprobe_cached = ffprobe_path is not None
+    return _ffprobe_path
+
+
+def ffprobe_available() -> bool:
+    return get_ffprobe_path() is not None
 
 
 def get_modification_datetime(file_path: Path) -> datetime:
@@ -314,11 +326,12 @@ class PhotoSorter:
     def extract_video_capture_info(
         self, file_path: Path
     ) -> tuple[datetime | None, str | None]:
-        if not self._has_ffprobe:
+        ffprobe = get_ffprobe_path()
+        if not ffprobe:
             return None, None
 
         cmd = [
-            "ffprobe",
+            ffprobe,
             "-v",
             "quiet",
             "-print_format",
