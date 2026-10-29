@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
-import threading
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -160,6 +160,231 @@ def reserve_unique_path(path: Path) -> Path:
 
 def default_worker_count() -> int:
     return min(8, max(4, os.cpu_count() or 4))
+
+
+def _pool_worker_init() -> None:
+    """Re-init native openers / caches inside each spawned process."""
+    global _ffprobe_cached, _ffprobe_path
+    _ffprobe_cached = None
+    _ffprobe_path = None
+    register_heif_opener()
+
+
+def claim_destination_path(
+    folder: Path,
+    filename: str,
+    *,
+    known_device: bool,
+    avoid_duplicates: bool,
+) -> Path | None:
+    """Reserve destination path. Returns None when skipping a device duplicate.
+
+    Uses O_EXCL so it is safe across threads and processes without a lock.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / filename
+    if avoid_duplicates and known_device:
+        try:
+            fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return target
+        except FileExistsError:
+            return None
+    return reserve_unique_path(target)
+
+
+def extract_image_capture_info(
+    file_path: Path,
+) -> tuple[datetime | None, str | None, str | None]:
+    """Returns (capture_dt, device, warning_or_none)."""
+    try:
+        ext = file_path.suffix.lower()
+        if ext in JPEG_EXTENSIONS:
+            raw = read_jpeg_exif_bytes(file_path)
+            if raw:
+                exif = Image.Exif()
+                exif.load(raw)
+                capture_dt, device = capture_info_from_exif(exif)
+                return capture_dt, device, None
+
+        with Image.open(file_path) as img:
+            capture_dt, device = capture_info_from_exif(img.getexif())
+            return capture_dt, device, None
+    except Exception as exc:
+        return None, None, f"Ошибка чтения EXIF {file_path.name}: {exc}"
+
+
+def extract_video_capture_info(
+    file_path: Path,
+) -> tuple[datetime | None, str | None, str | None]:
+    """Returns (capture_dt, device, warning_or_none)."""
+    ffprobe = get_ffprobe_path()
+    if not ffprobe:
+        return None, None, None
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(file_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, None, f"Ошибка ffprobe {file_path.name}: {exc}"
+
+    if result.returncode != 0:
+        return None, None, None
+
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None, None, None
+
+    tags: dict = {}
+    if isinstance(data.get("format"), dict):
+        tags.update(data["format"].get("tags") or {})
+    for stream in data.get("streams") or []:
+        if isinstance(stream, dict):
+            tags.update(stream.get("tags") or {})
+
+    lower_tags = {str(k).lower(): v for k, v in tags.items()}
+
+    make = lower_tags.get("make") or lower_tags.get("com.apple.quicktime.make")
+    model = lower_tags.get("model") or lower_tags.get("com.apple.quicktime.model")
+    device = device_from_make_model(
+        decode_meta_str(make if make is not None else None),
+        decode_meta_str(model if model is not None else None),
+    )
+
+    capture_dt = None
+    date_keys = (
+        "creation_time",
+        "com.apple.quicktime.creationdate",
+        "date",
+        "date_time_original",
+    )
+    for key in date_keys:
+        if key in lower_tags:
+            capture_dt = parse_video_datetime(lower_tags[key])
+            if capture_dt:
+                break
+
+    if capture_dt is None:
+        for key, value in lower_tags.items():
+            if "creation_time" in key or key.endswith("date"):
+                capture_dt = parse_video_datetime(value)
+                if capture_dt:
+                    break
+
+    return capture_dt, device, None
+
+
+def get_file_metadata(
+    file_path: Path,
+) -> tuple[dict, list[tuple[str, str]]]:
+    """Returns (metadata_dict, log_messages)."""
+    file_path = Path(file_path)
+    logs: list[tuple[str, str]] = []
+    ext = file_path.suffix.lower()
+    if ext in VIDEO_EXTENSIONS:
+        capture_dt, device, warn = extract_video_capture_info(file_path)
+    else:
+        capture_dt, device, warn = extract_image_capture_info(file_path)
+    if warn:
+        logs.append((warn, "warn"))
+    return build_result(file_path, capture_dt, device), logs
+
+
+def copy_fallback_file(
+    file_path: Path,
+    dest_path: Path,
+    year: str | None = None,
+    device: str | None = None,
+) -> tuple[Path | None, str | None]:
+    """Copy into year/device. Returns (path_or_none, error_or_none)."""
+    try:
+        if not year:
+            year = get_modification_datetime(file_path).strftime("%Y")
+        folder = dest_path / year / device_folder_name(device)
+        folder.mkdir(parents=True, exist_ok=True)
+
+        mod_dt = get_modification_datetime(file_path)
+        filename = safe_name(
+            f"{mod_dt.strftime('%Y-%m-%d_%H-%M-%S')}{file_path.suffix.lower()}",
+            fallback="file",
+        )
+        new_file_path = reserve_unique_path(folder / filename)
+        shutil.copy2(file_path, new_file_path)
+        return new_file_path, None
+    except Exception as exc:
+        return None, f"Не удалось сохранить fallback {file_path.name}: {exc}"
+
+
+def sort_one_file(
+    file_path: str,
+    dest_dir: str,
+    avoid_duplicates: bool,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Worker entrypoint for ProcessPoolExecutor (must stay top-level / picklable).
+
+    Returns (status, logs) where status is 'ok' | 'skipped' | 'error'.
+    """
+    logs: list[tuple[str, str]] = []
+    path = Path(file_path)
+    dest_path = Path(dest_dir)
+    year_hint: str | None = None
+    device_hint: str | None = None
+    reserved: Path | None = None
+    try:
+        metadata, meta_logs = get_file_metadata(path)
+        logs.extend(meta_logs)
+        year_hint = metadata["year"]
+        device_hint = metadata["device"]
+        folder_name = device_folder_name(device_hint)
+        known_device = folder_name != UNSORTED_DIR_NAME
+        device_folder = dest_path / year_hint / folder_name
+        new_filename = safe_name(metadata["filename"], fallback="file")
+        reserved = claim_destination_path(
+            device_folder,
+            new_filename,
+            known_device=known_device,
+            avoid_duplicates=avoid_duplicates,
+        )
+        if reserved is None:
+            logs.append(
+                (
+                    f"Пропуск (дубликат): {path.name} → "
+                    f"{year_hint}/{folder_name}/{new_filename}",
+                    "warn",
+                )
+            )
+            return "skipped", logs
+
+        shutil.copy2(path, reserved)
+        return "ok", logs
+    except Exception as exc:
+        if reserved is not None:
+            try:
+                reserved.unlink(missing_ok=True)
+            except OSError:
+                pass
+        logs.append((f"Ошибка сортировки {path}: {exc}", "warn"))
+        fallback, err = copy_fallback_file(
+            path, dest_path, year=year_hint, device=device_hint
+        )
+        if fallback is not None:
+            logs.append((f"Восстановлено → {fallback}", "warn"))
+            return "ok", logs
+        if err:
+            logs.append((err, "error"))
+        return "error", logs
 
 
 def paths_overlap(source: Path, dest: Path) -> bool:
@@ -324,7 +549,6 @@ class PhotoSorter:
         self.avoid_duplicates = avoid_duplicates
         self.supported_extensions = SUPPORTED_EXTENSIONS
         self._has_ffprobe = ffprobe_available()
-        self._dest_lock = threading.Lock()
 
     def log(self, message: str, level: str = "info") -> None:
         self.on_log(message, level)
@@ -347,101 +571,24 @@ class PhotoSorter:
     def extract_image_capture_info(
         self, file_path: Path
     ) -> tuple[datetime | None, str | None]:
-        try:
-            ext = file_path.suffix.lower()
-            if ext in JPEG_EXTENSIONS:
-                raw = read_jpeg_exif_bytes(file_path)
-                if raw:
-                    exif = Image.Exif()
-                    exif.load(raw)
-                    return capture_info_from_exif(exif)
-
-            # Lazy open: do not call img.load() — avoids full pixel decode.
-            with Image.open(file_path) as img:
-                return capture_info_from_exif(img.getexif())
-        except Exception as exc:
-            self.log(f"Ошибка чтения EXIF {file_path.name}: {exc}", "warn")
-            return None, None
+        capture_dt, device, warn = extract_image_capture_info(file_path)
+        if warn:
+            self.log(warn, "warn")
+        return capture_dt, device
 
     def extract_video_capture_info(
         self, file_path: Path
     ) -> tuple[datetime | None, str | None]:
-        ffprobe = get_ffprobe_path()
-        if not ffprobe:
-            return None, None
-
-        cmd = [
-            ffprobe,
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(file_path),
-        ]
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, check=False, timeout=60
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            self.log(f"Ошибка ffprobe {file_path.name}: {exc}", "warn")
-            return None, None
-
-        if result.returncode != 0:
-            return None, None
-
-        try:
-            data = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            return None, None
-
-        tags: dict = {}
-        if isinstance(data.get("format"), dict):
-            tags.update(data["format"].get("tags") or {})
-        for stream in data.get("streams") or []:
-            if isinstance(stream, dict):
-                tags.update(stream.get("tags") or {})
-
-        lower_tags = {str(k).lower(): v for k, v in tags.items()}
-
-        make = lower_tags.get("make") or lower_tags.get("com.apple.quicktime.make")
-        model = lower_tags.get("model") or lower_tags.get("com.apple.quicktime.model")
-        device = device_from_make_model(
-            decode_meta_str(make if make is not None else None),
-            decode_meta_str(model if model is not None else None),
-        )
-
-        capture_dt = None
-        date_keys = (
-            "creation_time",
-            "com.apple.quicktime.creationdate",
-            "date",
-            "date_time_original",
-        )
-        for key in date_keys:
-            if key in lower_tags:
-                capture_dt = parse_video_datetime(lower_tags[key])
-                if capture_dt:
-                    break
-
-        if capture_dt is None:
-            for key, value in lower_tags.items():
-                if "creation_time" in key or key.endswith("date"):
-                    capture_dt = parse_video_datetime(value)
-                    if capture_dt:
-                        break
-
+        capture_dt, device, warn = extract_video_capture_info(file_path)
+        if warn:
+            self.log(warn, "warn")
         return capture_dt, device
 
     def get_metadata(self, file_path: Path) -> dict:
-        file_path = Path(file_path)
-        ext = file_path.suffix.lower()
-        if ext in VIDEO_EXTENSIONS:
-            capture_dt, device = self.extract_video_capture_info(file_path)
-        else:
-            capture_dt, device = self.extract_image_capture_info(file_path)
-        return build_result(file_path, capture_dt, device)
+        metadata, logs = get_file_metadata(file_path)
+        for msg, level in logs:
+            self.log(msg, level)
+        return metadata
 
     def claim_destination(
         self,
@@ -450,19 +597,12 @@ class PhotoSorter:
         *,
         known_device: bool,
     ) -> Path | None:
-        """Reserve destination path. Returns None when skipping a device duplicate."""
-        target = folder / filename
-        with self._dest_lock:
-            if self.avoid_duplicates and known_device:
-                try:
-                    fd = os.open(
-                        str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                    )
-                    os.close(fd)
-                    return target
-                except FileExistsError:
-                    return None
-            return reserve_unique_path(target)
+        return claim_destination_path(
+            folder,
+            filename,
+            known_device=known_device,
+            avoid_duplicates=self.avoid_duplicates,
+        )
 
     def copy_fallback(
         self,
@@ -471,28 +611,10 @@ class PhotoSorter:
         year: str | None = None,
         device: str | None = None,
     ) -> Path | None:
-        """Copy into year/device (or Unknown Device), preserving known metadata."""
-        try:
-            if not year:
-                year = get_modification_datetime(file_path).strftime("%Y")
-            folder = dest_path / year / device_folder_name(device)
-            folder.mkdir(parents=True, exist_ok=True)
-
-            mod_dt = get_modification_datetime(file_path)
-            filename = safe_name(
-                f"{mod_dt.strftime('%Y-%m-%d_%H-%M-%S')}{file_path.suffix.lower()}",
-                fallback="file",
-            )
-            with self._dest_lock:
-                new_file_path = reserve_unique_path(folder / filename)
-            shutil.copy2(file_path, new_file_path)
-            return new_file_path
-        except Exception as exc:
-            self.log(
-                f"Не удалось сохранить fallback {file_path.name}: {exc}",
-                "error",
-            )
-            return None
+        out, err = copy_fallback_file(file_path, dest_path, year=year, device=device)
+        if err:
+            self.log(err, "error")
+        return out
 
     def copy_to_unsorted(
         self,
@@ -516,6 +638,16 @@ class PhotoSorter:
             seen.add(resolved)
             found.append(path)
         return found
+
+    def _apply_job_result(self, status: str, logs: list[tuple[str, str]]) -> tuple[bool, bool]:
+        """Apply worker result. Returns (ok_counted, skipped_dup)."""
+        for msg, level in logs:
+            self.log(msg, level)
+        if status == "skipped":
+            return True, True
+        if status == "ok":
+            return True, False
+        return False, False
 
     def sort_files(
         self,
@@ -578,94 +710,47 @@ class PhotoSorter:
                 else ""
             )
             self.log(
-                f"Найдено {total} файлов для обработки · потоков: {workers}{dup_note}",
+                f"Найдено {total} файлов для обработки · процессов: {workers}{dup_note}",
                 "info",
             )
             self.set_progress(0, total, 0, 0)
 
-            progress_lock = threading.Lock()
             was_cancelled = False
+            avoid = self.avoid_duplicates
+            dest_str = str(dest_path)
 
             def bump(ok: bool, *, skipped_dup: bool = False) -> None:
                 nonlocal processed, error_count, skipped
-                with progress_lock:
-                    if ok:
-                        processed += 1
-                        if skipped_dup:
-                            skipped += 1
-                    else:
-                        error_count += 1
-                    self.set_progress(processed, total, error_count, skipped)
+                if ok:
+                    processed += 1
+                    if skipped_dup:
+                        skipped += 1
+                else:
+                    error_count += 1
+                self.set_progress(processed, total, error_count, skipped)
 
-            def process_one(file_path: Path) -> None:
-                if self.cancelled():
-                    return
-
-                year_hint: str | None = None
-                device_hint: str | None = None
-                reserved: Path | None = None
-                try:
-                    metadata = self.get_metadata(file_path)
-                    if self.cancelled():
-                        return
-                    year_hint = metadata["year"]
-                    device_hint = metadata["device"]
-                    folder_name = device_folder_name(device_hint)
-                    known_device = folder_name != UNSORTED_DIR_NAME
-                    device_folder = dest_path / year_hint / folder_name
-                    device_folder.mkdir(parents=True, exist_ok=True)
-
-                    new_filename = safe_name(metadata["filename"], fallback="file")
-                    reserved = self.claim_destination(
-                        device_folder,
-                        new_filename,
-                        known_device=known_device,
-                    )
-                    if reserved is None:
-                        self.log(
-                            f"Пропуск (дубликат): {file_path.name} → "
-                            f"{year_hint}/{folder_name}/{new_filename}",
-                            "warn",
-                        )
-                        bump(True, skipped_dup=True)
-                        return
-
-                    if self.cancelled():
-                        reserved.unlink(missing_ok=True)
-                        return
-
-                    shutil.copy2(file_path, reserved)
-                    reserved = None
-                    bump(True)
-                except Exception as exc:
-                    if reserved is not None:
-                        try:
-                            reserved.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    self.log(f"Ошибка сортировки {file_path}: {exc}", "warn")
-                    fallback = self.copy_fallback(
-                        file_path,
-                        dest_path,
-                        year=year_hint,
-                        device=device_hint,
-                    )
-                    if fallback is not None:
-                        bump(True)
-                        self.log(f"Восстановлено → {fallback}", "warn")
-                    else:
-                        bump(False)
+            def handle_result(status: str, logs: list[tuple[str, str]]) -> None:
+                ok, skipped_dup = self._apply_job_result(status, logs)
+                bump(ok, skipped_dup=skipped_dup)
 
             if workers == 1:
                 for file_path in files_to_process:
                     if self.cancelled():
                         was_cancelled = True
                         break
-                    process_one(file_path)
+                    handle_result(
+                        *sort_one_file(str(file_path), dest_str, avoid)
+                    )
             else:
+                # spawn: safe when the parent already has GUI/threads (Flet).
+                ctx = multiprocessing.get_context("spawn")
                 pending: set = set()
                 file_iter = iter(files_to_process)
-                executor = ThreadPoolExecutor(max_workers=workers)
+                executor = ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=ctx,
+                    initializer=_pool_worker_init,
+                )
                 try:
 
                     def submit_available() -> None:
@@ -678,16 +763,25 @@ class PhotoSorter:
                                 next_file = next(file_iter)
                             except StopIteration:
                                 return
-                            pending.add(executor.submit(process_one, next_file))
+                            pending.add(
+                                executor.submit(
+                                    sort_one_file,
+                                    str(next_file),
+                                    dest_str,
+                                    avoid,
+                                )
+                            )
 
                     submit_available()
                     while pending:
                         if self.cancelled():
                             was_cancelled = True
                             break
-                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        done, pending = wait(
+                            pending, return_when=FIRST_COMPLETED
+                        )
                         for future in done:
-                            future.result()
+                            handle_result(*future.result())
                         if not was_cancelled:
                             submit_available()
                 finally:

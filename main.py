@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import shutil
 import subprocess
 import sys
@@ -876,4 +877,5 @@ def main(page: ft.Page) -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     ft.run(main)

@@ -218,19 +218,22 @@ class HelperTests(unittest.TestCase):
                 path.write_bytes(b"\xff\xd8\xff\xd9" + bytes([i]))
                 os.utime(path, (shared_mtime, shared_mtime))
 
-            def fake_meta(self, file_path: Path) -> dict:
-                return {
-                    "datetime": datetime(2024, 1, 1, 12, 0, 0),
-                    "device": "Pixel 7",
-                    "year": "2024",
-                    "filename": "2024-01-01_12-00-00.jpg",
-                }
+            def fake_meta(file_path: Path) -> tuple[dict, list]:
+                return (
+                    {
+                        "datetime": datetime(2024, 1, 1, 12, 0, 0),
+                        "device": "Pixel 7",
+                        "year": "2024",
+                        "filename": "2024-01-01_12-00-00.jpg",
+                    },
+                    [],
+                )
 
             logs: list[str] = []
 
-            with mock.patch.object(PhotoSorter, "get_metadata", fake_meta):
+            with mock.patch("sorter.get_file_metadata", fake_meta):
                 sorter = PhotoSorter(
-                    workers=2,
+                    workers=1,
                     avoid_duplicates=True,
                     on_log=lambda msg, _lvl: logs.append(msg),
                 )
