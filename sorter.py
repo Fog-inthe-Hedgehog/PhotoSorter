@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
+from statistics import median
 
 from PIL import Image
 from PIL.ExifTags import IFD, TAGS, Base
@@ -50,6 +54,9 @@ IMAGE_EXTENSIONS = {
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 UNSORTED_DIR_NAME = "Unknown Device"
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
+PHASH_DISTANCE_THRESHOLD = 6
+PHASH_SIZE = 32
+PHASH_LOW_FREQUENCIES = 8
 
 EXIF_DATE_TAGS = (
     Base.DateTimeOriginal,
@@ -59,6 +66,7 @@ EXIF_DATE_TAGS = (
 
 LogFn = Callable[[str, str], None]
 ProgressFn = Callable[[int, int, int, int], None]
+PhaseProgressFn = Callable[[str, int, int], None]
 CancelFn = Callable[[], bool]
 
 _ffprobe_cached: bool | None = None
@@ -158,6 +166,221 @@ def reserve_unique_path(path: Path) -> Path:
             counter += 1
 
 
+def sha256_file(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def perceptual_hash(file_path: Path) -> int:
+    """Return a 64-bit DCT perceptual hash for an image."""
+    with Image.open(file_path) as image:
+        pixels = list(
+            image.convert("L")
+            .resize((PHASH_SIZE, PHASH_SIZE), Image.Resampling.LANCZOS)
+            .get_flattened_data()
+        )
+
+    size = PHASH_SIZE
+    low = PHASH_LOW_FREQUENCIES
+    scale = [math.sqrt(1 / size)] + [math.sqrt(2 / size)] * (low - 1)
+    cosine = [
+        [
+            math.cos(math.pi * (2 * position + 1) * frequency / (2 * size))
+            for position in range(size)
+        ]
+        for frequency in range(low)
+    ]
+
+    horizontal = [
+        [
+            scale[frequency]
+            * sum(
+                pixels[row * size + column] * cosine[frequency][column]
+                for column in range(size)
+            )
+            for frequency in range(low)
+        ]
+        for row in range(size)
+    ]
+    coefficients = [
+        [
+            scale[vertical]
+            * sum(
+                horizontal[row][horizontal_frequency] * cosine[vertical][row]
+                for row in range(size)
+            )
+            for horizontal_frequency in range(low)
+        ]
+        for vertical in range(low)
+    ]
+
+    values = [
+        coefficients[row][column]
+        for row in range(low)
+        for column in range(low)
+        if row or column
+    ]
+    threshold = median(values)
+    result = 0
+    for row in range(low):
+        for column in range(low):
+            result = (result << 1) | int(coefficients[row][column] > threshold)
+    return result
+
+
+def _phash_bands(value: int) -> tuple[int, ...]:
+    return tuple((value >> (8 * band)) & 0xFF for band in range(8))
+
+
+def _hamming_distance(first: int, second: int) -> int:
+    return (first ^ second).bit_count()
+
+
+def find_duplicate_candidates(
+    files: list[Path],
+    dest_path: Path,
+    cancel_check: CancelFn,
+    on_log: LogFn,
+    on_progress: PhaseProgressFn,
+) -> tuple[dict[Path, Path], dict[Path, Path], list[str]]:
+    """Find exact and visually similar files against destination and source."""
+    exact_matches: dict[Path, Path] = {}
+    similar_matches: dict[Path, Path] = {}
+    warnings: list[str] = []
+    exact_index: dict[str, Path] = {}
+    image_hashes: list[tuple[Path, int]] = []
+    image_hash_ids: dict[int, int] = {}
+    band_index: dict[int, set[int]] = {}
+
+    def index_file(file_path: Path, *, source: bool) -> None:
+        if cancel_check():
+            return
+        try:
+            digest = sha256_file(file_path)
+        except OSError as exc:
+            warnings.append(
+                f"Не удалось проверить дублирование {file_path.name}: {exc}"
+            )
+            return
+
+        if digest in exact_index:
+            if source:
+                exact_matches[file_path] = exact_index[digest]
+            return
+        exact_index[digest] = file_path
+
+        if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            return
+        try:
+            image_hash = perceptual_hash(file_path)
+        except Exception as exc:
+            warnings.append(
+                f"Не удалось сравнить изображение {file_path.name}: {exc}"
+            )
+            return
+
+        candidate_ids: set[int] = set()
+        for band in _phash_bands(image_hash):
+            candidate_ids.update(band_index.get(band, set()))
+
+        closest: tuple[int, Path] | None = None
+        for candidate_id in candidate_ids:
+            candidate_path, candidate_hash = image_hashes[candidate_id]
+            distance = _hamming_distance(image_hash, candidate_hash)
+            if distance <= PHASH_DISTANCE_THRESHOLD and (
+                closest is None or distance < closest[0]
+            ):
+                closest = distance, candidate_path
+
+        if source and closest is not None:
+            similar_matches[file_path] = closest[1]
+
+        if image_hash not in image_hash_ids:
+            image_id = len(image_hashes)
+            image_hash_ids[image_hash] = image_id
+            image_hashes.append((file_path, image_hash))
+            for band in _phash_bands(image_hash):
+                band_index.setdefault(band, set()).add(image_id)
+
+    started_at = time.monotonic()
+    existing_scanned = 0
+    source_scanned = 0
+    existing_files: list[Path] = []
+
+    try:
+        on_progress("Сканирование папки назначения для поиска дублей", 0, 0)
+        on_log(f"Индексирую файлы в папке назначения: {dest_path}", "info")
+        for existing in dest_path.rglob("*"):
+            if cancel_check():
+                break
+            if existing.is_file() and existing.suffix.lower() in SUPPORTED_EXTENSIONS:
+                existing_files.append(existing)
+
+        work_total = len(existing_files) + len(files)
+        progress_interval = max(1, work_total // 100)
+        on_progress("Поиск точных и похожих фотографий", 0, work_total)
+        for existing in existing_files:
+            if cancel_check():
+                break
+            index_file(existing, source=False)
+            existing_scanned += 1
+            if existing_scanned % progress_interval == 0:
+                on_progress(
+                    "Поиск точных и похожих фотографий",
+                    existing_scanned,
+                    work_total,
+                )
+            if existing_scanned % 100 == 0:
+                on_log(
+                    f"Проверено файлов назначения: {existing_scanned}/"
+                    f"{len(existing_files)}",
+                    "info",
+                )
+        on_log(
+            f"Индексирование папки назначения завершено: "
+            f"{existing_scanned} файлов за {time.monotonic() - started_at:.1f} с",
+            "info",
+        )
+        if not cancel_check():
+            on_log(
+                f"Сравниваю исходные файлы по SHA-256 и pHash: {len(files)} шт.",
+                "info",
+            )
+            for file_path in files:
+                if cancel_check():
+                    break
+                index_file(file_path, source=True)
+                source_scanned += 1
+                processed_for_index = existing_scanned + source_scanned
+                if (
+                    processed_for_index % progress_interval == 0
+                    or processed_for_index == work_total
+                ):
+                    on_progress(
+                        "Поиск точных и похожих фотографий",
+                        processed_for_index,
+                        work_total,
+                    )
+                if source_scanned % 100 == 0:
+                    on_log(
+                        f"Проверено исходных файлов: {source_scanned}/{len(files)}",
+                        "info",
+                    )
+    except OSError as exc:
+        warnings.append(f"Не удалось просканировать папку сохранения: {exc}")
+
+    on_log(
+        f"Проверка дублей завершена: исходных проверено {source_scanned}/{len(files)}, "
+        f"точных копий {len(exact_matches)}, похожих фото {len(similar_matches)}, "
+        f"время {time.monotonic() - started_at:.1f} с",
+        "info",
+    )
+    return exact_matches, similar_matches, warnings
+
+
 def default_worker_count() -> int:
     return min(8, max(4, os.cpu_count() or 4))
 
@@ -173,24 +396,9 @@ def _pool_worker_init() -> None:
 def claim_destination_path(
     folder: Path,
     filename: str,
-    *,
-    known_device: bool,
-    avoid_duplicates: bool,
-) -> Path | None:
-    """Reserve destination path. Returns None when skipping a device duplicate.
-
-    Uses O_EXCL so it is safe across threads and processes without a lock.
-    """
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / filename
-    if avoid_duplicates and known_device:
-        try:
-            fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            return target
-        except FileExistsError:
-            return None
-    return reserve_unique_path(target)
+) -> Path:
+    """Reserve a unique destination name safely across processes."""
+    return reserve_unique_path(folder / filename)
 
 
 def extract_image_capture_info(
@@ -330,7 +538,8 @@ def copy_fallback_file(
 def sort_one_file(
     file_path: str,
     dest_dir: str,
-    avoid_duplicates: bool,
+    exact_duplicate_of: str | None = None,
+    similar_to: str | None = None,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Worker entrypoint for ProcessPoolExecutor (must stay top-level / picklable).
 
@@ -339,34 +548,36 @@ def sort_one_file(
     logs: list[tuple[str, str]] = []
     path = Path(file_path)
     dest_path = Path(dest_dir)
+    if exact_duplicate_of is not None:
+        logs.append(
+            (
+                f"Точный дубль, не перенесён: исходный файл «{path}» "
+                f"совпадает по SHA-256 с оригиналом «{exact_duplicate_of}»",
+                "warn",
+            )
+        )
+        return "skipped", logs
+
     year_hint: str | None = None
     device_hint: str | None = None
     reserved: Path | None = None
     try:
         metadata, meta_logs = get_file_metadata(path)
         logs.extend(meta_logs)
-        year_hint = metadata["year"]
-        device_hint = metadata["device"]
-        folder_name = device_folder_name(device_hint)
-        known_device = folder_name != UNSORTED_DIR_NAME
-        device_folder = dest_path / year_hint / folder_name
-        new_filename = safe_name(metadata["filename"], fallback="file")
-        reserved = claim_destination_path(
-            device_folder,
-            new_filename,
-            known_device=known_device,
-            avoid_duplicates=avoid_duplicates,
-        )
-        if reserved is None:
+        if similar_to is not None:
             logs.append(
                 (
-                    f"Пропуск (дубликат): {path.name} → "
-                    f"{year_hint}/{folder_name}/{new_filename}",
+                    f"Похожее фото, сохранено: исходный файл «{path}» "
+                    f"похож по pHash на оригинал «{similar_to}»",
                     "warn",
                 )
             )
-            return "skipped", logs
-
+        year_hint = metadata["year"]
+        device_hint = metadata["device"]
+        folder_name = device_folder_name(device_hint)
+        device_folder = dest_path / year_hint / folder_name
+        new_filename = safe_name(metadata["filename"], fallback="file")
+        reserved = claim_destination_path(device_folder, new_filename)
         shutil.copy2(path, reserved)
         return "ok", logs
     except Exception as exc:
@@ -541,12 +752,16 @@ class PhotoSorter:
         cancel_check: CancelFn | None = None,
         workers: int | None = None,
         avoid_duplicates: bool = False,
+        on_phase_progress: PhaseProgressFn | None = None,
     ):
         self.on_log = on_log or (lambda _msg, _level: None)
         self.on_progress = on_progress or (lambda _p, _t, _e, _s: None)
         self.cancel_check = cancel_check or (lambda: False)
         self.workers = workers
         self.avoid_duplicates = avoid_duplicates
+        self.on_phase_progress = on_phase_progress or (
+            lambda _phase, _current, _total: None
+        )
         self.supported_extensions = SUPPORTED_EXTENSIONS
         self._has_ffprobe = ffprobe_available()
 
@@ -594,15 +809,8 @@ class PhotoSorter:
         self,
         folder: Path,
         filename: str,
-        *,
-        known_device: bool,
-    ) -> Path | None:
-        return claim_destination_path(
-            folder,
-            filename,
-            known_device=known_device,
-            avoid_duplicates=self.avoid_duplicates,
-        )
+    ) -> Path:
+        return claim_destination_path(folder, filename)
 
     def copy_fallback(
         self,
@@ -627,7 +835,18 @@ class PhotoSorter:
     def collect_files(self, source_path: Path) -> list[Path]:
         found: list[Path] = []
         seen: set[Path] = set()
+        visited = 0
+        self.log(f"Сканирую исходную папку: {source_path}", "info")
+        self.on_phase_progress("Сканирование исходной папки", 0, 0)
         for path in source_path.rglob("*"):
+            visited += 1
+            if visited % 1000 == 0:
+                self.on_phase_progress("Сканирование исходной папки", visited, 0)
+                self.log(
+                    f"Просмотрено элементов исходной папки: {visited}; "
+                    f"поддерживаемых файлов найдено: {len(found)}",
+                    "info",
+                )
             if not path.is_file():
                 continue
             if path.suffix.lower() not in self.supported_extensions:
@@ -637,6 +856,11 @@ class PhotoSorter:
                 continue
             seen.add(resolved)
             found.append(path)
+        self.log(
+            f"Сканирование завершено: просмотрено элементов {visited}, "
+            f"поддерживаемых файлов найдено {len(found)}",
+            "info",
+        )
         return found
 
     def _apply_job_result(self, status: str, logs: list[tuple[str, str]]) -> tuple[bool, bool]:
@@ -679,9 +903,15 @@ class PhotoSorter:
                 return False, 0, 0, 1, 0
 
             dest_path.mkdir(parents=True, exist_ok=True)
+            self.log(f"Папка назначения доступна: {dest_path}", "info")
             dest_resolved = dest_path.resolve()
 
             collected = self.collect_files(source_path)
+            self.log(
+                f"Обход источника завершён: найдено поддерживаемых файлов "
+                f"{len(collected)}",
+                "info",
+            )
             files_to_process: list[Path] = []
             for file_path in collected:
                 try:
@@ -696,6 +926,11 @@ class PhotoSorter:
                     self.log(f"Пропуск (недоступен путь) {file_path}: {exc}", "warn")
 
             total = len(files_to_process)
+            self.log(
+                f"К обработке допущено файлов: {total}; исключено из папки "
+                f"назначения: {len(collected) - total}",
+                "info",
+            )
 
             if total == 0:
                 self.log(
@@ -704,8 +939,30 @@ class PhotoSorter:
                 )
                 return False, 0, 0, 0, 0
 
+            exact_duplicates: dict[Path, Path] = {}
+            similar_photos: dict[Path, Path] = {}
+            if self.avoid_duplicates:
+                self.log("Проверка точных и похожих фотографий…", "info")
+                (
+                    exact_duplicates,
+                    similar_photos,
+                    fingerprint_warnings,
+                ) = find_duplicate_candidates(
+                    files_to_process,
+                    dest_path,
+                    self.cancelled,
+                    self.log,
+                    self.on_phase_progress,
+                )
+                for warning in fingerprint_warnings:
+                    self.log(warning, "warn")
+                if self.cancelled():
+                    self.log("Проверка дубликатов отменена", "warn")
+                    return False, 0, total, 0, 0
+
+            self.on_phase_progress("Сортировка файлов", 0, total)
             dup_note = (
-                " · без дубликатов устройств"
+                " · поиск точных и похожих фото"
                 if self.avoid_duplicates
                 else ""
             )
@@ -713,10 +970,13 @@ class PhotoSorter:
                 f"Найдено {total} файлов для обработки · процессов: {workers}{dup_note}",
                 "info",
             )
+            self.log(
+                f"Режим обработки: "
+                f"{'последовательно' if workers == 1 else 'пул из ' + str(workers) + ' процессов'}",
+                "info",
+            )
             self.set_progress(0, total, 0, 0)
-
             was_cancelled = False
-            avoid = self.avoid_duplicates
             dest_str = str(dest_path)
 
             def bump(ok: bool, *, skipped_dup: bool = False) -> None:
@@ -739,7 +999,20 @@ class PhotoSorter:
                         was_cancelled = True
                         break
                     handle_result(
-                        *sort_one_file(str(file_path), dest_str, avoid)
+                        *sort_one_file(
+                            str(file_path),
+                            dest_str,
+                            (
+                                str(exact_duplicates[file_path])
+                                if file_path in exact_duplicates
+                                else None
+                            ),
+                            (
+                                str(similar_photos[file_path])
+                                if file_path in similar_photos
+                                else None
+                            ),
+                        )
                     )
             else:
                 # spawn: safe when the parent already has GUI/threads (Flet).
@@ -768,7 +1041,16 @@ class PhotoSorter:
                                     sort_one_file,
                                     str(next_file),
                                     dest_str,
-                                    avoid,
+                                    (
+                                        str(exact_duplicates[next_file])
+                                        if next_file in exact_duplicates
+                                        else None
+                                    ),
+                                    (
+                                        str(similar_photos[next_file])
+                                        if next_file in similar_photos
+                                        else None
+                                    ),
                                 )
                             )
 
@@ -781,7 +1063,15 @@ class PhotoSorter:
                             pending, return_when=FIRST_COMPLETED
                         )
                         for future in done:
-                            handle_result(*future.result())
+                            try:
+                                handle_result(*future.result())
+                            except Exception as exc:
+                                self.log(
+                                    f"Задание worker завершилось необработанной "
+                                    f"ошибкой: {exc}",
+                                    "error",
+                                )
+                                raise
                         if not was_cancelled:
                             submit_available()
                 finally:

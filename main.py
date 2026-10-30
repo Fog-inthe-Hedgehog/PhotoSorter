@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import traceback
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -53,10 +54,6 @@ UI_LOG_MAX = 80
 UI_PENDING_LOG_MAX = 40
 # Flush log file every N lines (avoid lock+fsync per message from worker threads).
 LOG_FLUSH_EVERY = 64
-# Duplicate skips go to the file only — not the UI ring (too chatty).
-_UI_SKIP_PREFIXES = ("Пропуск (дубликат):",)
-
-
 def shorten_path(path: str, max_len: int = 64) -> str:
     if len(path) <= max_len:
         return path
@@ -115,6 +112,8 @@ def main(page: ft.Page) -> None:
     ui_lock = threading.Lock()
     pending_logs: deque[tuple[str, str]] = deque(maxlen=UI_PENDING_LOG_MAX)
     pending_progress: tuple[int, int, int, int] | None = None
+    pending_phase_progress: tuple[str, int, int] | None = None
+    duplicate_report_counts = {"exact": 0, "similar": 0}
     flush_task: asyncio.Task | None = None
     flush_scheduled = False
 
@@ -309,8 +308,9 @@ def main(page: ft.Page) -> None:
         label="Избегать дублирования",
         value=False,
         tooltip=(
-            "В папках устройств пропускать файл, если имя уже занято. "
-            f"Для «{UNSORTED_DIR_NAME}» по-прежнему добавляется суффикс _1, _2…"
+            "Пропускать точные копии по SHA-256. "
+            "Похожие изображения по pHash будут отмечены в логе, "
+            "но сохранены."
         ),
     )
     browse_dest_btn = ft.OutlinedButton("Обзор…", icon=ft.Icons.FOLDER_OPEN)
@@ -411,18 +411,37 @@ def main(page: ft.Page) -> None:
     def _apply_progress(
         processed: int, total: int, errors: int, skipped: int = 0
     ) -> None:
+        phase_offset = 0.5 if avoid_duplicates_cb.value else 0.0
         if total <= 0:
-            progress_bar.value = 0
+            progress_bar.value = phase_offset
         else:
             safe_processed = min(processed, total)
-            progress_bar.value = safe_processed / total
+            progress_bar.value = phase_offset + (
+                1 - phase_offset
+            ) * safe_processed / total
         status_text.value = (
             f"Обработано {processed} / {total} · ошибок: {errors}"
             + _dup_status_suffix(skipped)
         )
 
-    def _show_in_ui_log(message: str) -> bool:
-        return not message.startswith(_UI_SKIP_PREFIXES)
+    def _apply_phase_progress(phase: str, current: int, total: int) -> None:
+        if total <= 0:
+            progress_bar.value = None
+            suffix = f" · просмотрено {current}" if current else ""
+            status_text.value = f"{phase}{suffix}"
+            return
+
+        duplicate_phase = phase == "Поиск точных и похожих фотографий"
+        phase_offset = (
+            0.0 if duplicate_phase else 0.5 if avoid_duplicates_cb.value else 0.0
+        )
+        phase_scale = (
+            0.5 if duplicate_phase else 0.5 if avoid_duplicates_cb.value else 1.0
+        )
+        progress_bar.value = (
+            phase_offset + phase_scale * min(current, total) / total
+        )
+        status_text.value = f"{phase}: {current} / {total}"
 
     def request_ui_flush() -> None:
         """Schedule at most one UI flush; safe to call from worker threads."""
@@ -444,7 +463,7 @@ def main(page: ft.Page) -> None:
 
     async def flush_ui(*, force: bool = False) -> None:
         """Drain coalesced log/progress and call page.update once (event loop only)."""
-        nonlocal pending_progress, flush_task, flush_scheduled
+        nonlocal pending_progress, pending_phase_progress, flush_task, flush_scheduled
         flush_task = None
 
         with ui_lock:
@@ -452,9 +471,11 @@ def main(page: ft.Page) -> None:
             pending_logs.clear()
             progress = pending_progress
             pending_progress = None
+            phase_progress = pending_phase_progress
+            pending_phase_progress = None
             flush_scheduled = False
 
-        if not force and not logs and progress is None:
+        if not force and not logs and progress is None and phase_progress is None:
             return
 
         try:
@@ -463,6 +484,12 @@ def main(page: ft.Page) -> None:
                     _append_log_control(msg, level)
                 except Exception as e:
                     print(f"Ошибка при добавлении лога: {e}")
+
+            if phase_progress is not None:
+                try:
+                    _apply_phase_progress(*phase_progress)
+                except Exception as e:
+                    print(f"Ошибка при обновлении этапа прогресса: {e}")
 
             if progress is not None:
                 try:
@@ -476,25 +503,40 @@ def main(page: ft.Page) -> None:
 
         # Workers may have queued more while we were updating.
         with ui_lock:
-            more = bool(pending_logs) or pending_progress is not None
+            more = (
+                bool(pending_logs)
+                or pending_progress is not None
+                or pending_phase_progress is not None
+            )
         if more:
             request_ui_flush()
 
     def enqueue_log(message: str, level: str = "info") -> None:
         """Stream to file immediately; coalesce UI updates (no per-line call_soon flood)."""
         write_log_line(message, level)
-        if not _show_in_ui_log(message):
-            return
         with ui_lock:
+            if message.startswith("Точный дубль, не перенесён:"):
+                duplicate_report_counts["exact"] += 1
+            elif message.startswith("Похожее фото, сохранено:"):
+                duplicate_report_counts["similar"] += 1
             pending_logs.append((message, level))
+        request_ui_flush()
+
+    def enqueue_phase_progress(phase: str, current: int, total: int) -> None:
+        """Coalesce a discovery/copy phase update from the sorting thread."""
+        nonlocal pending_progress, pending_phase_progress
+        with ui_lock:
+            pending_progress = None
+            pending_phase_progress = (phase, current, total)
         request_ui_flush()
 
     def enqueue_progress(
         processed: int, total: int, errors: int, skipped: int = 0
     ) -> None:
         """Coalesce progress under a lock; one scheduled UI flush at a time."""
-        nonlocal pending_progress
+        nonlocal pending_progress, pending_phase_progress
         with ui_lock:
+            pending_phase_progress = None
             pending_progress = (processed, total, errors, skipped)
         request_ui_flush()
 
@@ -665,11 +707,22 @@ def main(page: ft.Page) -> None:
         is_sorting = False
         set_controls_busy(False)
         dup_suffix = _dup_status_suffix(skipped)
-        dup_dialog = (
-            f"\nПропущено дубликатов: {skipped}"
-            if avoid_duplicates_cb.value
-            else ""
-        )
+        with ui_lock:
+            exact_duplicate_count = duplicate_report_counts["exact"]
+            similar_photo_count = duplicate_report_counts["similar"]
+        dup_dialog = ""
+        if avoid_duplicates_cb.value:
+            append_log(
+                f"Итог проверки дублей: точных не перенесено "
+                f"{exact_duplicate_count}; похожих сохранено "
+                f"{similar_photo_count}",
+                "info",
+            )
+            dup_dialog = (
+                f"\nТочные дубликаты — не перенесены: {exact_duplicate_count}"
+                f"\nПохожие фото — сохранены: {similar_photo_count}"
+                "\nИмена оригинальных файлов записаны в лог."
+            )
 
         if was_cancelled:
             status_text.value = (
@@ -714,7 +767,9 @@ def main(page: ft.Page) -> None:
 
     async def start_sorting(_e=None) -> None:
         nonlocal is_sorting, source_path, dest_path
+        append_log("Получен запрос на запуск сортировки", "info")
         if is_sorting:
+            append_log("Запуск отклонён: сортировка уже выполняется", "warn")
             show_dialog("Информация", "Сортировка уже выполняется")
             return
 
@@ -722,18 +777,26 @@ def main(page: ft.Page) -> None:
         dest_path = (dest_field.value or "").strip()
 
         if not source_path:
+            append_log("Запуск остановлен: исходная папка не выбрана", "warn")
             show_dialog("Предупреждение", "Выберите папку с фотографиями")
             return
         if not dest_path:
+            append_log("Запуск остановлен: папка сохранения не выбрана", "warn")
             show_dialog("Предупреждение", "Выберите папку для сохранения")
             return
 
         src = Path(source_path)
         dst = Path(dest_path)
         if not src.is_dir():
+            append_log(f"Запуск остановлен: исходная папка недоступна: {src}", "error")
             show_dialog("Предупреждение", "Исходная папка не существует")
             return
         if paths_overlap(src, dst):
+            append_log(
+                f"Запуск остановлен: исходная и целевая папки пересекаются: "
+                f"{src} ↔ {dst}",
+                "error",
+            )
             show_dialog(
                 "Ошибка",
                 "Папка сохранения не должна совпадать с исходной "
@@ -742,6 +805,9 @@ def main(page: ft.Page) -> None:
             return
 
         cancel_event.clear()
+        with ui_lock:
+            duplicate_report_counts["exact"] = 0
+            duplicate_report_counts["similar"] = 0
         is_sorting = True
         set_controls_busy(True)
         progress_bar.value = 0
@@ -759,20 +825,32 @@ def main(page: ft.Page) -> None:
             return
 
         append_log(f"Лог: {log_path}", "info")
-        append_log("Сортировка запущена", "info")
+        append_log(
+            f"Сортировка запущена: источник={src}, назначение={dst}, "
+            f"поиск дублей={'включён' if avoid_duplicates_cb.value else 'выключен'}",
+            "info",
+        )
 
         def run_sort() -> tuple[bool, int, int, int, int]:
+            enqueue_log("Рабочий поток сортировки начал выполнение", "info")
             sorter = PhotoSorter(
                 on_log=enqueue_log,
                 on_progress=enqueue_progress,
                 cancel_check=cancel_event.is_set,
                 avoid_duplicates=bool(avoid_duplicates_cb.value),
+                on_phase_progress=enqueue_phase_progress,
+            )
+            enqueue_log(
+                f"Сортировщик создан; ffprobe "
+                f"{'доступен' if has_ffprobe else 'не найден'}",
+                "info",
             )
             return sorter.sort_files(source_path, dest_path)
 
         try:
             result = await asyncio.to_thread(run_sort)
         except Exception as exc:
+            write_log_line(traceback.format_exc(), "error")
             await flush_ui(force=True)
             is_sorting = False
             set_controls_busy(False)

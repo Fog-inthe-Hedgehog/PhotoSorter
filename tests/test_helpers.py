@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image, ImageDraw
+
 from sorter import (
     UNSORTED_DIR_NAME,
     PhotoSorter,
@@ -205,7 +207,7 @@ class HelperTests(unittest.TestCase):
             expected = sorted(b"\xff\xd8\xff\xd9" + bytes([i]) for i in range(8))
             self.assertEqual(payloads, expected)
 
-    def test_avoid_duplicates_skips_known_device(self) -> None:
+    def test_avoid_duplicates_skips_identical_contents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "src"
@@ -215,7 +217,7 @@ class HelperTests(unittest.TestCase):
             shared_mtime = 1_700_000_000
             for i in range(3):
                 path = src / f"f{i}.jpg"
-                path.write_bytes(b"\xff\xd8\xff\xd9" + bytes([i]))
+                path.write_bytes(b"identical-photo-content")
                 os.utime(path, (shared_mtime, shared_mtime))
 
             def fake_meta(file_path: Path) -> tuple[dict, list]:
@@ -250,7 +252,131 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(len(copied), 1)
             self.assertEqual(copied[0].name, "2024-01-01_12-00-00.jpg")
             self.assertEqual(copied[0].parent.name, "Pixel 7")
-            self.assertTrue(any("дубликат" in msg for msg in logs))
+            self.assertTrue(any("Точный дубль" in msg for msg in logs))
+            self.assertTrue(
+                any(
+                    msg.count(str(src)) == 2
+                    for msg in logs
+                    if "Точный дубль" in msg
+                )
+            )
+
+    def test_exact_duplicate_of_existing_destination_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dest = root / "dest"
+            src.mkdir()
+            existing = dest / "archive" / "existing.jpg"
+            existing.parent.mkdir(parents=True)
+            existing.write_bytes(b"same-image-file")
+            incoming = src / "incoming.jpg"
+            incoming.write_bytes(existing.read_bytes())
+
+            logs: list[str] = []
+            sorter = PhotoSorter(
+                workers=2,
+                avoid_duplicates=True,
+                on_log=lambda msg, _lvl: logs.append(msg),
+            )
+            success, processed, total, errors, skipped = sorter.sort_files(
+                str(src), str(dest)
+            )
+
+            self.assertTrue(success)
+            self.assertEqual((processed, total, errors, skipped), (1, 1, 0, 1))
+            self.assertEqual(len(list(dest.rglob("*.jpg"))), 1)
+            self.assertTrue(any("SHA-256" in msg for msg in logs))
+            report = next(msg for msg in logs if "Точный дубль" in msg)
+            self.assertIn(str(incoming), report)
+            self.assertIn(str(existing), report)
+
+    def test_different_contents_with_same_destination_name_are_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dest = root / "dest"
+            src.mkdir()
+            for name, content in (
+                ("first.jpg", b"first-photo"),
+                ("second.jpg", b"second-photo"),
+            ):
+                path = src / name
+                path.write_bytes(content)
+                os.utime(path, (1_700_000_000, 1_700_000_000))
+
+            def fake_meta(_file_path: Path) -> tuple[dict, list]:
+                return (
+                    {
+                        "datetime": datetime(2024, 1, 1, 12, 0, 0),
+                        "device": "Pixel 7",
+                        "year": "2024",
+                        "filename": "2024-01-01_12-00-00.jpg",
+                    },
+                    [],
+                )
+
+            with mock.patch("sorter.get_file_metadata", fake_meta):
+                sorter = PhotoSorter(workers=1, avoid_duplicates=True)
+                success, processed, total, errors, skipped = sorter.sort_files(
+                    str(src), str(dest)
+                )
+
+            self.assertTrue(success)
+            self.assertEqual((processed, total, errors, skipped), (2, 2, 0, 0))
+            copied = sorted(dest.rglob("*.jpg"))
+            self.assertEqual(len(copied), 2)
+            self.assertEqual(
+                {path.read_bytes() for path in copied},
+                {b"first-photo", b"second-photo"},
+            )
+
+    def test_similar_photo_is_logged_and_still_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dest = root / "dest"
+            src.mkdir()
+            shared_mtime = 1_700_000_000
+            for name, quality in (("first.jpg", 95), ("second.jpg", 40)):
+                image = Image.new("RGB", (128, 96), "white")
+                draw = ImageDraw.Draw(image)
+                draw.rectangle((12, 14, 70, 75), fill=(20, 80, 160))
+                draw.ellipse((75, 20, 115, 60), fill=(220, 40, 30))
+                path = src / name
+                image.save(path, quality=quality)
+                os.utime(path, (shared_mtime, shared_mtime))
+
+            logs: list[str] = []
+            phase_progress: list[tuple[str, int, int]] = []
+            sorter = PhotoSorter(
+                workers=1,
+                avoid_duplicates=True,
+                on_log=lambda msg, _lvl: logs.append(msg),
+                on_phase_progress=lambda phase, current, total: phase_progress.append(
+                    (phase, current, total)
+                ),
+            )
+            success, processed, total, errors, skipped = sorter.sort_files(
+                str(src), str(dest)
+            )
+
+            self.assertTrue(success)
+            self.assertEqual((processed, total, errors, skipped), (2, 2, 0, 0))
+            self.assertEqual(len(list(dest.rglob("*.jpg"))), 2)
+            report = next(msg for msg in logs if "Похожее фото, сохранено" in msg)
+            self.assertIn(str(src), report)
+            self.assertIn("first.jpg", report)
+            self.assertIn("second.jpg", report)
+            self.assertTrue(
+                any(
+                    phase == "Поиск точных и похожих фотографий"
+                    and current > 0
+                    and total > 0
+                    for phase, current, total in phase_progress
+                )
+            )
+            self.assertIn(("Сортировка файлов", 0, 2), phase_progress)
 
     def test_avoid_duplicates_renames_unknown_device(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
