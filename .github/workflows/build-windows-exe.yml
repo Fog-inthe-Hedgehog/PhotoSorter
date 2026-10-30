@@ -51,7 +51,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          poetry install --no-interaction --with dev
+          poetry install --no-interaction --with dev --no-root
+
+      - name: Run Python tests
+        run: |
+          poetry run python -m unittest discover -s tests -v
 
       - name: Build Windows executable with Flet
         shell: pwsh
@@ -61,17 +65,63 @@ jobs:
           $env:FORCE_COLOR = "0"
           poetry run flet build windows -o dist/flet-windows --skip-flutter-doctor --yes --no-rich-output
 
-      - name: Locate Windows EXE
+      - name: Verify Windows drag-and-drop plugin
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist/flet-windows-output | Out-Null
-          $exe = Get-ChildItem -Path . -Recurse -Filter "PhotoSorter.exe" | Select-Object -First 1 -Expand FullName
-          if (-not $exe) { throw "PhotoSorter.exe not found" }
-          Copy-Item $exe -Destination dist/flet-windows-output/PhotoSorter.exe
+          $registrant = "build/flutter/windows/flutter/generated_plugin_registrant.cc"
+          $plugins = "build/flutter/windows/flutter/generated_plugins.cmake"
+          $dropzone = "build/flutter-packages/flet_dropzone/lib/src/flet_dropzone.dart"
 
-      - name: Upload EXE artifact
+          foreach ($path in @($registrant, $plugins, $dropzone)) {
+            if (-not (Test-Path $path)) {
+              throw "Expected generated drag-and-drop build file not found: $path"
+            }
+          }
+
+          $registrantText = Get-Content $registrant -Raw
+          if ($registrantText -notmatch "DesktopDropPluginRegisterWithRegistrar") {
+            throw "desktop_drop is missing from the Windows plugin registrant"
+          }
+
+          $pluginsText = Get-Content $plugins -Raw
+          if ($pluginsText -notmatch "(?m)^\s+desktop_drop\s*$") {
+            throw "desktop_drop is missing from the Windows CMake plugin list"
+          }
+
+          $dropzoneText = Get-Content $dropzone -Raw
+          if ($dropzoneText -notmatch "DropTarget" -or $dropzoneText -notmatch "onDragDone") {
+            throw "The generated flet_dropzone control does not handle dropped files"
+          }
+
+      - name: Stage complete Windows application
+        shell: pwsh
+        run: |
+          $searchRoots = @("dist/flet-windows", "build/windows") |
+            Where-Object { Test-Path $_ }
+          $exe = Get-ChildItem -Path $searchRoots -Recurse -File -Filter "*.exe" |
+            Where-Object { $_.BaseName -ieq "photosorter" } |
+            Select-Object -First 1
+          if (-not $exe) { throw "PhotoSorter Windows executable not found" }
+
+          $bundle = $exe.Directory.FullName
+          if (-not (Test-Path (Join-Path $bundle "flutter_windows.dll"))) {
+            throw "The Windows Flutter runtime is missing next to $($exe.Name)"
+          }
+          if (-not (Test-Path (Join-Path $bundle "data"))) {
+            throw "The Windows application data directory is missing next to $($exe.Name)"
+          }
+
+          $stage = "dist/PhotoSorter-Windows"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path (Join-Path $bundle "*") -Destination $stage -Recurse -Force
+
+          if (-not (Test-Path (Join-Path $stage $exe.Name))) {
+            throw "Failed to stage the executable and its runtime files"
+          }
+
+      - name: Upload Windows application bundle
         uses: actions/upload-artifact@v4
         with:
-          name: PhotoSorter-Windows-EXE
-          path: dist/flet-windows-output/PhotoSorter.exe
+          name: PhotoSorter-Windows-x64
+          path: dist/PhotoSorter-Windows/
           if-no-files-found: error
