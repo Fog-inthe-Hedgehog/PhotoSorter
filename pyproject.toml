@@ -26,6 +26,7 @@ company = "PhotoSorter"
 
 [tool.flet.app]
 path = "."
+exclude = [".venv"]
 
 [tool.poetry.group.dev.dependencies]
 pyinstaller = ">=6.10.0,<7.0.0"
