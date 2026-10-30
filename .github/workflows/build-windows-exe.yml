@@ -63,7 +63,7 @@ jobs:
           $env:PYTHONIOENCODING = "utf-8"
           $env:TERM = "dumb"
           $env:FORCE_COLOR = "0"
-          poetry run flet build windows -o dist/flet-windows --skip-flutter-doctor --yes --no-rich-output
+          poetry run flet build windows -vv -o dist/flet-windows --skip-flutter-doctor --yes --no-rich-output
 
       - name: Verify Windows drag-and-drop plugin
         shell: pwsh
